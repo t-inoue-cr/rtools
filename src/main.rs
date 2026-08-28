@@ -17,6 +17,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_japanese_fonts(&cc.egui_ctx);
+            cc.egui_ctx.set_theme(egui::ThemePreference::Light);
+            apply_ui_style(&cc.egui_ctx);
             Ok(Box::new(RToolsApp::default()))
         }),
     )
@@ -28,23 +30,62 @@ fn windows_fonts_dir() -> PathBuf {
 }
 
 fn load_japanese_font() -> Option<egui::FontData> {
-    const CANDIDATES: &[&str] = &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"];
+    // TTC collections include both document faces (index 0) and UI faces.
+    // Document 游ゴシック has extra descent, so button text looks too high.
+    const CANDIDATES: &[(&str, u32)] = &[
+        ("YuGothM.ttc", 1), // Yu Gothic UI Regular
+        ("YuGothB.ttc", 2), // Yu Gothic UI Semibold
+        ("YuGothR.ttc", 1), // Yu Gothic UI Semilight
+        ("meiryo.ttc", 2),  // Meiryo UI
+        ("msgothic.ttc", 1), // MS UI Gothic
+        ("YuGothM.ttc", 0),
+        ("meiryo.ttc", 0),
+        ("YuGothR.ttc", 0),
+        ("msgothic.ttc", 0),
+    ];
     let fonts_dir = windows_fonts_dir();
-    for name in CANDIDATES {
+    for &(name, index) in CANDIDATES {
         if let Ok(bytes) = fs::read(fonts_dir.join(name)) {
-            return Some(egui::FontData::from_owned(bytes));
+            let mut font = egui::FontData::from_owned(bytes);
+            font.index = index;
+            return Some(font);
         }
     }
     None
 }
 
 fn apply_ui_style(ctx: &egui::Context) {
-    // Mutate both light and dark styles. `style_mut` only changes the active theme,
-    // so OS theme detection can silently keep the default cramped spacing.
     ctx.all_styles_mut(|style| {
         style.spacing.button_padding = egui::vec2(16.0, 10.0);
         style.spacing.item_spacing = egui::vec2(12.0, 10.0);
-        style.spacing.interact_size.y = 36.0;
+        style.spacing.interact_size.y = 40.0;
+
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(16.0, egui::FontFamily::Proportional),
+        );
+
+        let text = egui::Color32::from_gray(20);
+        let widgets = &mut style.visuals.widgets;
+        widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text);
+        widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, text);
+        widgets.active.fg_stroke = egui::Stroke::new(2.0_f32, text);
+
+        widgets.inactive.weak_bg_fill = egui::Color32::WHITE;
+        widgets.inactive.bg_fill = egui::Color32::from_gray(240);
+        widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+
+        widgets.hovered.weak_bg_fill = egui::Color32::from_gray(235);
+        widgets.hovered.bg_fill = egui::Color32::from_gray(225);
+        widgets.hovered.bg_stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(40, 80, 160));
+        widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+
+        widgets.active.weak_bg_fill = egui::Color32::from_gray(210);
+        widgets.active.bg_fill = egui::Color32::from_gray(200);
+        widgets.active.bg_stroke = egui::Stroke::new(2.0_f32, egui::Color32::BLACK);
+        widgets.active.corner_radius = egui::CornerRadius::same(6);
     });
 }
 
@@ -61,12 +102,12 @@ fn install_japanese_fonts(ctx: &egui::Context) {
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .push("jp".to_owned());
+        .insert(0, "jp".to_owned());
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .push("jp".to_owned());
+        .insert(0, "jp".to_owned());
     ctx.set_fonts(fonts);
 }
 
@@ -125,8 +166,6 @@ impl RToolsApp {
 
 impl eframe::App for RToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        apply_ui_style(ctx);
-
         egui::TopBottomPanel::top("toolbar")
             .min_height(56.0)
             .frame(
@@ -134,12 +173,13 @@ impl eframe::App for RToolsApp {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
                 ui.horizontal(|ui| {
                     if ui
                         .add(
                             egui::Button::new("フォルダ内のファイル一覧を保存")
-                                .min_size(egui::vec2(0.0, 36.0)),
+                                .min_size(egui::vec2(0.0, 40.0))
+                                .corner_radius(6.0)
+                                .fill(egui::Color32::from_rgb(232, 240, 254)),
                         )
                         .clicked()
                     {
@@ -149,15 +189,22 @@ impl eframe::App for RToolsApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("ログ");
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
+            egui::Frame::new()
+                .fill(ui.visuals().extreme_bg_color)
+                .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_gray(80)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(8, 8))
                 .show(ui, |ui| {
-                    ui.add_sized(
-                        ui.available_size(),
-                        egui::TextEdit::multiline(&mut self.log).desired_width(f32::INFINITY),
-                    );
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.log)
+                                    .desired_width(f32::INFINITY)
+                                    .frame(false),
+                            );
+                        });
                 });
         });
     }
