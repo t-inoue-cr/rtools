@@ -38,6 +38,16 @@ fn load_japanese_font() -> Option<egui::FontData> {
     None
 }
 
+fn apply_ui_style(ctx: &egui::Context) {
+    // Mutate both light and dark styles. `style_mut` only changes the active theme,
+    // so OS theme detection can silently keep the default cramped spacing.
+    ctx.all_styles_mut(|style| {
+        style.spacing.button_padding = egui::vec2(16.0, 10.0);
+        style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+        style.spacing.interact_size.y = 36.0;
+    });
+}
+
 fn install_japanese_fonts(ctx: &egui::Context) {
     let Some(font_data) = load_japanese_font() else {
         return;
@@ -115,15 +125,28 @@ impl RToolsApp {
 
 impl eframe::App for RToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("buttons").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("フォルダ内のファイル一覧を保存").clicked() {
-                    self.export_file_list();
-                }
+        apply_ui_style(ctx);
+
+        egui::TopBottomPanel::top("toolbar")
+            .min_height(56.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new("フォルダ内のファイル一覧を保存")
+                                .min_size(egui::vec2(0.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.export_file_list();
+                    }
+                });
             });
-            ui.add_space(6.0);
-        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("ログ");
