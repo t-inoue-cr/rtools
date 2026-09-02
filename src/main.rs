@@ -55,7 +55,7 @@ fn windows_fonts_dir() -> PathBuf {
 fn load_japanese_font() -> Option<egui::FontData> {
     // TTC collections include both document faces (index 0) and UI faces.
     // Document 游ゴシック has extra descent, so button text looks too high.
-    const CANDIDATES: &[(&str, u32)] = &[
+    const WINDOWS_CANDIDATES: &[(&str, u32)] = &[
         ("YuGothM.ttc", 1),  // Yu Gothic UI Regular
         ("YuGothB.ttc", 2),  // Yu Gothic UI Semibold
         ("YuGothR.ttc", 1),  // Yu Gothic UI Semilight
@@ -67,8 +67,25 @@ fn load_japanese_font() -> Option<egui::FontData> {
         ("msgothic.ttc", 0),
     ];
     let fonts_dir = windows_fonts_dir();
-    for &(name, index) in CANDIDATES {
+    for &(name, index) in WINDOWS_CANDIDATES {
         if let Ok(bytes) = fs::read(fonts_dir.join(name)) {
+            let mut font = egui::FontData::from_owned(bytes);
+            font.index = index;
+            return Some(font);
+        }
+    }
+
+    const LINUX_CANDIDATES: &[(&str, u32)] = &[
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+        (
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            0,
+        ),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+    ];
+    for &(path, index) in LINUX_CANDIDATES {
+        if let Ok(bytes) = fs::read(path) {
             let mut font = egui::FontData::from_owned(bytes);
             font.index = index;
             return Some(font);

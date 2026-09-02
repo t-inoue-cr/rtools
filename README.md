@@ -1,6 +1,6 @@
 # rtools
 
-Windows 向けの小さなデスクトップツール（eframe / egui）です。フォルダ内のファイル一覧保存に加え、PDF を OpenSearch へ登録してキーワード検索できます。
+Windows 向けの小さなデスクトップツール（eframe / egui）です。フォルダ内のファイル一覧保存に加え、PDF を OpenSearch へ登録してキーワード検索できます。Linux では日本語フォントのフォールバックと GTK 3 のフォルダ選択を使います（xdg-desktop-portal は使いません）。Windows のファイルダイアログは従来どおりネイティブです。
 
 ## 設定
 
