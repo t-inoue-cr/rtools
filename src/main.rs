@@ -1,9 +1,17 @@
+mod opensearch;
+mod pdf;
+mod settings;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+
+use opensearch::{IngestReport, SearchHit, SearchOutcome};
+use pdf::collect_pdfs;
+use settings::OpenSearchSettings;
 
 enum ExportState {
     Idle,
@@ -13,10 +21,16 @@ enum ExportState {
     Writing,
 }
 
+enum IngestState {
+    Idle,
+    PickFolder,
+    Running,
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 480.0])
+            .with_inner_size([880.0, 640.0])
             .with_title("rtools"),
         ..Default::default()
     };
@@ -121,15 +135,20 @@ fn install_japanese_fonts(ctx: &egui::Context) {
 
 struct RToolsApp {
     log: String,
-    #[allow(dead_code)] // kept so workers can log via the background thread
     log_tx: Sender<String>,
     log_buffer: Arc<Mutex<String>>,
     log_follow_bottom: bool,
     log_len_shown: usize,
     export: ExportState,
+    ingest: IngestState,
     yield_before_action: bool,
     list_rx: Option<Receiver<Result<Vec<String>, String>>>,
     write_rx: Option<Receiver<Result<PathBuf, String>>>,
+    ingest_rx: Option<Receiver<Result<IngestReport, String>>>,
+    search_rx: Option<Receiver<Result<SearchOutcome, String>>>,
+    search_query: String,
+    search_hits: Vec<SearchHit>,
+    search_status: String,
 }
 
 impl RToolsApp {
@@ -159,11 +178,29 @@ impl RToolsApp {
             log_follow_bottom: true,
             log_len_shown: 0,
             export: ExportState::Idle,
+            ingest: IngestState::Idle,
             yield_before_action: false,
             list_rx: None,
             write_rx: None,
+            ingest_rx: None,
+            search_rx: None,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_status: "検索結果はここに表示されます。".into(),
         };
         app.log_line("rtools を起動しました。");
+        match settings::load_settings() {
+            Ok((path, cfg)) => {
+                app.log_line(format!(
+                    "OpenSearch 設定を読み込みました: {}  index={}  認証={}  ({})",
+                    cfg.base_url(),
+                    cfg.index(),
+                    cfg.auth_label(),
+                    path.display()
+                ));
+            }
+            Err(err) => app.log_line(err),
+        }
         app
     }
 
@@ -176,15 +213,29 @@ impl RToolsApp {
     }
 
     fn sync_log(&mut self) {
-        if let Ok(buffer) = self.log_buffer.lock() {
-            if buffer.len() > self.log.len() {
-                self.log.clone_from(&buffer);
-            }
+        if let Ok(buffer) = self.log_buffer.lock()
+            && buffer.len() > self.log.len()
+        {
+            self.log.clone_from(&buffer);
         }
     }
 
     fn is_idle(&self) -> bool {
         matches!(self.export, ExportState::Idle)
+            && matches!(self.ingest, IngestState::Idle)
+            && self.search_rx.is_none()
+    }
+
+    fn busy_hint(&self) -> Option<&'static str> {
+        if !matches!(self.export, ExportState::Idle) {
+            Some("ファイル一覧を処理中…")
+        } else if !matches!(self.ingest, IngestState::Idle) {
+            Some("PDFを登録中…")
+        } else if self.search_rx.is_some() {
+            Some("検索中…")
+        } else {
+            None
+        }
     }
 
     fn start_export(&mut self) {
@@ -193,17 +244,50 @@ impl RToolsApp {
         self.yield_before_action = true;
     }
 
-    fn poll_export(&mut self, ctx: &egui::Context) {
-        if self.yield_before_action {
-            self.yield_before_action = false;
-            ctx.request_repaint();
+    fn start_ingest(&mut self) {
+        self.log_line("PDF フォルダの選択ダイアログを開きます。");
+        self.ingest = IngestState::PickFolder;
+        self.yield_before_action = true;
+    }
+
+    fn start_search(&mut self) {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            self.log_line("検索キーワードを入力してください。");
             return;
         }
 
+        let settings = match load_opensearch_or_log(&mut self.log, &self.log_buffer) {
+            Some(settings) => settings,
+            None => return,
+        };
+
+        self.log_line(format!("検索しています: {query}"));
+        self.search_status = "検索中…".into();
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some(rx);
+        let log_tx = self.log_tx.clone();
+
+        std::thread::Builder::new()
+            .name("opensearch-search".into())
+            .spawn(move || {
+                let result = opensearch::search(&settings, &query);
+                if let Err(err) = &result {
+                    let _ = log_tx.send(format!("検索に失敗しました: {err}"));
+                }
+                let _ = tx.send(result);
+            })
+            .expect("failed to spawn search thread");
+    }
+
+    fn poll_export(&mut self, ctx: &egui::Context) {
         if matches!(self.export, ExportState::Idle) {
             return;
         }
         if matches!(self.export, ExportState::PickFolder) {
+            if self.yield_before_action {
+                return;
+            }
             self.pick_folder();
             return;
         }
@@ -212,11 +296,66 @@ impl RToolsApp {
             return;
         }
         if matches!(self.export, ExportState::PickSave { .. }) {
+            if self.yield_before_action {
+                return;
+            }
             self.pick_save();
             return;
         }
         if matches!(self.export, ExportState::Writing) {
             self.poll_writing(ctx);
+        }
+    }
+
+    fn poll_ingest(&mut self, ctx: &egui::Context) {
+        if matches!(self.ingest, IngestState::Idle) {
+            return;
+        }
+        if matches!(self.ingest, IngestState::PickFolder) {
+            if self.yield_before_action {
+                return;
+            }
+            self.pick_ingest_folder();
+            return;
+        }
+        if matches!(self.ingest, IngestState::Running) {
+            self.poll_ingest_worker(ctx);
+        }
+    }
+
+    fn poll_search(&mut self, ctx: &egui::Context) {
+        let recv = {
+            let Some(rx) = &self.search_rx else {
+                return;
+            };
+            rx.try_recv()
+        };
+
+        match recv {
+            Ok(Ok(outcome)) => {
+                self.search_rx = None;
+                self.search_hits = outcome.hits;
+                self.search_status = format!(
+                    "{} 件ヒット（表示 {} 件）",
+                    outcome.total,
+                    self.search_hits.len()
+                );
+                self.log_line(self.search_status.clone());
+            }
+            Ok(Err(err)) => {
+                self.search_rx = None;
+                self.search_hits.clear();
+                self.search_status = format!("検索に失敗しました: {err}");
+                self.log_line(self.search_status.clone());
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.search_rx = None;
+                self.search_status = "検索に失敗しました: ワーカーが終了しました。".into();
+                self.log_line(self.search_status.clone());
+            }
         }
     }
 
@@ -233,6 +372,94 @@ impl RToolsApp {
         self.log_line(format!("フォルダ: {}", folder.display()));
         self.log_line("ファイル一覧を取得しています。");
         self.start_listing(folder);
+    }
+
+    fn pick_ingest_folder(&mut self) {
+        self.ingest = IngestState::Idle;
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title("PDFが入ったフォルダを選択")
+            .pick_folder()
+        else {
+            self.log_line("PDF フォルダの選択をキャンセルしました。");
+            return;
+        };
+
+        self.log_line(format!("PDF フォルダ: {}", folder.display()));
+
+        let Some(settings) = load_opensearch_or_log(&mut self.log, &self.log_buffer) else {
+            return;
+        };
+
+        self.start_ingest_worker(settings, folder);
+    }
+
+    fn start_ingest_worker(&mut self, settings: OpenSearchSettings, folder: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.ingest_rx = Some(rx);
+        self.ingest = IngestState::Running;
+        let log_tx = self.log_tx.clone();
+
+        std::thread::Builder::new()
+            .name("opensearch-ingest".into())
+            .spawn(move || {
+                let result = (|| {
+                    let _ = log_tx.send("PDF ファイルを列挙しています。".into());
+                    let pdfs = collect_pdfs(&folder)?;
+                    if pdfs.is_empty() {
+                        return Err("フォルダ内に PDF ファイルが見つかりませんでした。".into());
+                    }
+                    let _ = log_tx.send(format!("PDF ファイル数: {}", pdfs.len()));
+                    for path in pdfs.iter().take(20) {
+                        let _ = log_tx.send(format!("  - {}", path.display()));
+                    }
+                    if pdfs.len() > 20 {
+                        let _ = log_tx.send(format!("  …ほか {} 件", pdfs.len() - 20));
+                    }
+                    opensearch::ingest_files(&settings, &pdfs, &log_tx)
+                })();
+                let _ = tx.send(result);
+            })
+            .expect("failed to spawn ingest thread");
+    }
+
+    fn poll_ingest_worker(&mut self, ctx: &egui::Context) {
+        let recv = {
+            let Some(rx) = &self.ingest_rx else {
+                self.ingest = IngestState::Idle;
+                return;
+            };
+            rx.try_recv()
+        };
+
+        match recv {
+            Ok(Ok(report)) => {
+                self.ingest_rx = None;
+                self.ingest = IngestState::Idle;
+                self.log_line(format!(
+                    "登録が完了しました: 成功 {} ファイル / 失敗 {} / {} チャンク",
+                    report.files_ok, report.files_fail, report.chunks
+                ));
+                for err in report.errors.iter().take(8) {
+                    self.log_line(format!("  警告: {err}"));
+                }
+                if report.errors.len() > 8 {
+                    self.log_line(format!("  …ほか {} 件の警告", report.errors.len() - 8));
+                }
+            }
+            Ok(Err(err)) => {
+                self.ingest_rx = None;
+                self.ingest = IngestState::Idle;
+                self.log_line(format!("登録に失敗しました: {err}"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.ingest_rx = None;
+                self.ingest = IngestState::Idle;
+                self.log_line("登録に失敗しました: ワーカーが終了しました。");
+            }
+        }
     }
 
     fn start_listing(&mut self, folder: PathBuf) {
@@ -352,34 +579,148 @@ impl RToolsApp {
     }
 }
 
+fn load_opensearch_or_log(
+    log: &mut String,
+    log_buffer: &Arc<Mutex<String>>,
+) -> Option<OpenSearchSettings> {
+    match settings::load_settings() {
+        Ok((path, settings)) => {
+            let line = format_log_line(&format!(
+                "接続先: {}  index={}  ({})",
+                settings.base_url(),
+                settings.index(),
+                path.display()
+            ));
+            log.push_str(&line);
+            if let Ok(mut buffer) = log_buffer.lock() {
+                buffer.push_str(&line);
+            }
+            Some(settings)
+        }
+        Err(err) => {
+            let line = format_log_line(&err);
+            log.push_str(&line);
+            if let Ok(mut buffer) = log_buffer.lock() {
+                buffer.push_str(&line);
+            }
+            None
+        }
+    }
+}
+
 impl eframe::App for RToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_log();
-        self.poll_export(ctx);
+        if self.yield_before_action {
+            self.yield_before_action = false;
+            ctx.request_repaint();
+        } else {
+            self.poll_export(ctx);
+            self.poll_ingest(ctx);
+            self.poll_search(ctx);
+        }
         self.sync_log();
 
         let idle = self.is_idle();
         let follow_bottom = self.log_follow_bottom;
+        let busy_hint = self.busy_hint();
+        let can_search = idle && !self.search_query.trim().is_empty();
 
         egui::TopBottomPanel::top("toolbar")
-            .min_height(56.0)
+            .min_height(108.0)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let button = egui::Button::new("フォルダ内のファイル一覧を保存")
+                    let export_button = egui::Button::new("フォルダ内のファイル一覧を保存")
                         .min_size(egui::vec2(0.0, 40.0))
                         .corner_radius(6.0)
                         .fill(egui::Color32::from_rgb(232, 240, 254));
-                    if ui.add_enabled(idle, button).clicked() {
+                    if ui.add_enabled(idle, export_button).clicked() {
                         self.start_export();
+                    }
+
+                    let ingest_button = egui::Button::new("PDFをOpenSearchに登録")
+                        .min_size(egui::vec2(0.0, 40.0))
+                        .corner_radius(6.0)
+                        .fill(egui::Color32::from_rgb(232, 240, 254));
+                    if ui.add_enabled(idle, ingest_button).clicked() {
+                        self.start_ingest();
+                    }
+
+                    if let Some(hint) = busy_hint {
+                        ui.label(hint);
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("検索キーワード");
+                    let edit = egui::TextEdit::singleline(&mut self.search_query)
+                        .desired_width(320.0)
+                        .hint_text("キーワードを入力")
+                        .min_size(egui::vec2(0.0, 32.0));
+                    let response = ui.add_enabled(idle, edit);
+                    let enter =
+                        response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                    let search_button = egui::Button::new("検索")
+                        .min_size(egui::vec2(0.0, 40.0))
+                        .corner_radius(6.0)
+                        .fill(egui::Color32::from_rgb(232, 240, 254));
+                    if ui.add_enabled(can_search, search_button).clicked() || (enter && can_search)
+                    {
+                        self.start_search();
                     }
                 });
             });
 
+        egui::TopBottomPanel::bottom("search-results")
+            .resizable(true)
+            .default_height(200.0)
+            .min_height(120.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("検索結果").strong());
+                ui.label(&self.search_status);
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_gray(80)))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(8, 8))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("search-hits")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.search_hits.is_empty() {
+                                    ui.label("ヒットはありません。");
+                                    return;
+                                }
+                                for hit in &self.search_hits {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{:.2}", hit.score));
+                                        ui.strong(&hit.title);
+                                        ui.label(format!("p.{}", hit.page));
+                                    });
+                                    if !hit.path.is_empty() {
+                                        ui.weak(&hit.path);
+                                    }
+                                    if !hit.snippet.is_empty() {
+                                        ui.label(&hit.snippet);
+                                    }
+                                    ui.separator();
+                                }
+                            });
+                    });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label(egui::RichText::new("ログ").strong());
             egui::Frame::new()
                 .fill(ui.visuals().extreme_bg_color)
                 .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_gray(80)))
@@ -388,6 +729,7 @@ impl eframe::App for RToolsApp {
                 .show(ui, |ui| {
                     let log_grew = self.log.len() != self.log_len_shown;
                     let output = egui::ScrollArea::vertical()
+                        .id_salt("log")
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .animated(false)

@@ -1,0 +1,26 @@
+//! OpenSearch 接続設定のサンプルです。
+//!
+//! このファイルを `setting.toml` にコピーし、接続先に合わせて編集してください。
+//! 探索順: 実行ファイルと同じフォルダ → カレントディレクトリ。
+//!
+//! パスワードや API キーは Git にコミットしないでください。
+
+[opensearch]
+# 接続 URL。指定すると host / port / scheme より優先されます。
+url = "https://localhost:9200"
+
+# url を空にした場合に使われます。
+# host = "localhost"
+# port = 9200
+# scheme = "https"
+
+# 登録・検索するインデックス名
+index = "pdf_docs"
+
+# 認証（username/password または api_key のどちらか）
+username = "admin"
+password = "changeme"
+# api_key = ""
+
+# 自己署名証明書の OpenSearch に接続する場合は true
+insecure_skip_tls_verify = true
