@@ -54,13 +54,7 @@ pub fn ingest_files(
             path.display()
         ));
         match structure_pdf(path) {
-            Ok((docs, used_pdftotext)) => {
-                if used_pdftotext {
-                    let _ = log.send(format!(
-                        "pdftotext で抽出しました（pdf-extract が UniJIS / CMap に未対応のため）: {}",
-                        path.display()
-                    ));
-                }
+            Ok(docs) => {
                 files_ok += 1;
                 chunks.extend(docs);
             }

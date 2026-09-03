@@ -32,8 +32,4 @@ OpenSearch 本体の起動や Docker 化はこのアプリの対象外です。�
 - **PDFをOpenSearchに登録** — PDF が入ったフォルダを選び、再帰的に `.pdf` を集めてテキスト化してインデックスします。
 - **検索** — キーワードを入れて検索し、ヒットを画面下部に表示します。
 
-PDF はまず `pdf-extract`（純 Rust）でテキスト抽出します。日本語特許 PDF（OpenPDF / JPO、`UniJIS-UCS2-H` などの CMap）では `pdf-extract` が失敗することがあるため、その場合は PATH 上の Poppler `pdftotext -layout` にフォールバックします（出力は一時ファイル経由。Windows のコンソールコードページに依存しません）。どちらも失敗したときは、Poppler の導入を案内するエラーを出します。
-
-Windows で特許 PDF を扱う場合は [Poppler for Windows](https://github.com/oschwartz10612/poppler-windows/releases) などを入れ、`pdftotext.exe` があるフォルダを PATH に追加してください。
-
-抽出テキストはフォームフィードがあればページ単位、なければ約 1800 文字のチャンクに分割して登録します（フィールド: `title`, `file_name`, `path`, `page`, `chunk`, `text`, `ingested_at`）。スキャン画像のみの PDF は OCR しないため、プレースホルダ文言だけが登録されることがあります。
+PDF は純 Rust の `pdf_oxide` でテキスト抽出します。日本語特許 PDF（OpenPDF / JPO、UniJIS-UCS2-H など）もこのクレートで扱います。ページごとに抽出し、フォームフィードでつなぐので、ページ単位のチャンク分割が使えます。ページ区切りが無い場合は約 1800 文字のチャンクに分割して登録します（フィールド: `title`, `file_name`, `path`, `page`, `chunk`, `text`, `ingested_at`）。スキャン画像のみの PDF は OCR しないため、プレースホルダ文言だけが登録されることがあります。
