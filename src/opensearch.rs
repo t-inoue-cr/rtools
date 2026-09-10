@@ -11,7 +11,7 @@ use crate::pdf::{PdfChunk, structure_pdf};
 use crate::settings::OpenSearchSettings;
 
 const BULK_BATCH: usize = 80;
-const SEARCH_SIZE: usize = 50;
+const SEARCH_SIZE: usize = 10;
 
 /// OpenSearch highlight 用の内部マーカー。UI で背景色に変換する。
 pub const HIGHLIGHT_PRE: &str = "<mark>";
@@ -37,6 +37,7 @@ pub struct SearchHit {
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub total: u64,
+    pub max_score: f64,
     pub hits: Vec<SearchHit>,
 }
 
@@ -147,8 +148,7 @@ pub fn search(settings: &OpenSearchSettings, query: &str) -> Result<SearchOutcom
             "multi_match": {
                 "query": query,
                 "fields": ["text^3", "title^2", "file_name"],
-                "type": "best_fields",
-                "operator": "and"
+                "type": "best_fields"
             }
         },
         "highlight": {
@@ -196,7 +196,20 @@ pub fn parse_search_response(text: &str) -> Result<SearchOutcome, String> {
             hits.push(parse_hit(hit));
         }
     }
-    Ok(SearchOutcome { total, hits })
+    let max_score = hits_obj
+        .get("max_score")
+        .and_then(Value::as_f64)
+        .filter(|score| *score > 0.0)
+        .unwrap_or_else(|| {
+            hits.iter()
+                .map(|hit| hit.score)
+                .fold(0.0_f64, f64::max)
+        });
+    Ok(SearchOutcome {
+        total,
+        max_score,
+        hits,
+    })
 }
 
 fn parse_total(total: Option<&Value>) -> u64 {
@@ -512,6 +525,7 @@ mod tests {
         let json = r#"{
             "hits": {
                 "total": { "value": 2, "relation": "eq" },
+                "max_score": 1.5,
                 "hits": [
                     {
                         "_score": 1.5,
@@ -528,6 +542,7 @@ mod tests {
         }"#;
         let out = parse_search_response(json).unwrap();
         assert_eq!(out.total, 2);
+        assert_eq!(out.max_score, 1.5);
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].title, "仕様書");
         assert_eq!(out.hits[0].page, 3);
@@ -553,7 +568,23 @@ mod tests {
         let json = r#"{ "hits": { "total": 4, "hits": [] } }"#;
         let out = parse_search_response(json).unwrap();
         assert_eq!(out.total, 4);
+        assert_eq!(out.max_score, 0.0);
         assert!(out.hits.is_empty());
+    }
+
+    #[test]
+    fn max_score_falls_back_to_hit_scores() {
+        let json = r#"{
+            "hits": {
+                "total": 2,
+                "hits": [
+                    { "_score": 0.8, "_source": { "title": "a", "page": 1, "text": "x" } },
+                    { "_score": 1.2, "_source": { "title": "b", "page": 1, "text": "y" } }
+                ]
+            }
+        }"#;
+        let out = parse_search_response(json).unwrap();
+        assert_eq!(out.max_score, 1.2);
     }
 
     #[test]

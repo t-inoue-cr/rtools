@@ -165,6 +165,7 @@ struct RToolsApp {
     search_rx: Option<Receiver<Result<SearchOutcome, String>>>,
     search_query: String,
     search_hits: Vec<SearchHit>,
+    search_max_score: f64,
     search_status: String,
 }
 
@@ -203,6 +204,7 @@ impl RToolsApp {
             search_rx: None,
             search_query: String::new(),
             search_hits: Vec::new(),
+            search_max_score: 0.0,
             search_status: "検索結果はここに表示されます。".into(),
         };
         app.log_line("rtools を起動しました。");
@@ -351,6 +353,7 @@ impl RToolsApp {
         match recv {
             Ok(Ok(outcome)) => {
                 self.search_rx = None;
+                self.search_max_score = outcome.max_score;
                 self.search_hits = outcome.hits;
                 self.search_status = format!(
                     "{} 件ヒット（表示 {} 件）",
@@ -362,6 +365,7 @@ impl RToolsApp {
             Ok(Err(err)) => {
                 self.search_rx = None;
                 self.search_hits.clear();
+                self.search_max_score = 0.0;
                 self.search_status = format!("検索に失敗しました: {err}");
                 self.log_line(self.search_status.clone());
             }
@@ -370,6 +374,8 @@ impl RToolsApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.search_rx = None;
+                self.search_hits.clear();
+                self.search_max_score = 0.0;
                 self.search_status = "検索に失敗しました: ワーカーが終了しました。".into();
                 self.log_line(self.search_status.clone());
             }
@@ -758,7 +764,7 @@ impl eframe::App for RToolsApp {
                             }
                             for hit in &self.search_hits {
                                 ui.horizontal(|ui| {
-                                    ui.label(format!("{:.2}", hit.score));
+                                    ui.label(similarity_label(hit.score, self.search_max_score));
                                     ui.strong(&hit.title);
                                     ui.label(format!("p.{}", hit.page));
                                 });
@@ -775,6 +781,15 @@ impl eframe::App for RToolsApp {
         });
 
         self.log_len_shown = self.log.len();
+    }
+}
+
+fn similarity_label(score: f64, max_score: f64) -> String {
+    if max_score <= 0.0 {
+        "類似度 —".into()
+    } else {
+        let pct = ((score / max_score) * 100.0).round() as i32;
+        format!("類似度 {pct}%")
     }
 }
 
