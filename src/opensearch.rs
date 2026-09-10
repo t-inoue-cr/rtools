@@ -7,6 +7,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::embedding::{self, EMBEDDING_DIM};
 use crate::pdf::{PdfChunk, structure_pdf};
 use crate::settings::OpenSearchSettings;
 
@@ -107,15 +108,22 @@ pub fn ingest_pdfs(
     }
 
     let client = build_client(settings)?;
-    ensure_index(&client, settings)?;
+    ensure_index(&client, settings, log)?;
 
+    let _ = log
+        .send("埋め込みモデルを準備しています（初回は約 120MB のダウンロードがあります）。".into());
     let ingested_at = Utc::now().to_rfc3339();
     let mut indexed = 0usize;
     let mut errors = Vec::new();
 
     for batch in chunks.chunks(BULK_BATCH) {
-        match bulk_index(&client, settings, batch, &ingested_at) {
-            Ok(n) => indexed += n,
+        let texts: Vec<&str> = batch.iter().map(|chunk| chunk.text.as_str()).collect();
+        match embedding::embed_passages(&texts) {
+            Ok(embeddings) => match bulk_index(&client, settings, batch, &ingested_at, &embeddings)
+            {
+                Ok(n) => indexed += n,
+                Err(err) => errors.push(err),
+            },
             Err(err) => errors.push(err),
         }
         let _ = log.send(format!("登録進捗: {indexed}/{} チャンク", chunks.len()));
@@ -139,33 +147,76 @@ pub fn search(settings: &OpenSearchSettings, query: &str) -> Result<SearchOutcom
         return Err("検索キーワードが空です。".into());
     }
 
-    let client = build_client(settings)?;
-    let url = format!("{}/{}/_search", settings.base_url(), settings.index());
-    let body = json!({
+    post_search(
+        settings,
+        &json!({
+            "size": SEARCH_SIZE,
+            "track_total_hits": true,
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["text^3", "title^2", "file_name"],
+                    "type": "best_fields"
+                }
+            },
+            "highlight": {
+                "pre_tags": [HIGHLIGHT_PRE],
+                "post_tags": [HIGHLIGHT_POST],
+                "fields": {
+                    "text": {
+                        "fragment_size": 160,
+                        "number_of_fragments": 2
+                    }
+                }
+            }
+        }),
+    )
+}
+
+/// 文章のベクトル近傍検索（kNN）。BM25 のキーワード検索とは別経路。
+pub fn knn_search(settings: &OpenSearchSettings, query: &str) -> Result<SearchOutcome, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("検索文が空です。".into());
+    }
+    let vector = embedding::embed_query(query)?;
+    search_knn_vector(settings, &vector)
+}
+
+fn search_knn_vector(
+    settings: &OpenSearchSettings,
+    vector: &[f32],
+) -> Result<SearchOutcome, String> {
+    if vector.len() != EMBEDDING_DIM {
+        return Err(format!(
+            "埋め込み次元が {EMBEDDING_DIM} ではありません（{}）。",
+            vector.len()
+        ));
+    }
+    post_search(settings, &knn_search_body(vector))
+}
+
+pub fn knn_search_body(vector: &[f32]) -> Value {
+    json!({
         "size": SEARCH_SIZE,
         "track_total_hits": true,
         "query": {
-            "multi_match": {
-                "query": query,
-                "fields": ["text^3", "title^2", "file_name"],
-                "type": "best_fields"
-            }
-        },
-        "highlight": {
-            "pre_tags": [HIGHLIGHT_PRE],
-            "post_tags": [HIGHLIGHT_POST],
-            "fields": {
-                "text": {
-                    "fragment_size": 160,
-                    "number_of_fragments": 2
+            "knn": {
+                "embedding": {
+                    "vector": vector,
+                    "k": SEARCH_SIZE
                 }
             }
         }
-    });
+    })
+}
 
+fn post_search(settings: &OpenSearchSettings, body: &Value) -> Result<SearchOutcome, String> {
+    let client = build_client(settings)?;
+    let url = format!("{}/{}/_search", settings.base_url(), settings.index());
     let response = with_auth(client.post(&url), settings)
         .header(CONTENT_TYPE, "application/json")
-        .json(&body)
+        .json(body)
         .send()
         .map_err(|err| format!("OpenSearch 検索に失敗しました: {err}"))?;
 
@@ -200,11 +251,7 @@ pub fn parse_search_response(text: &str) -> Result<SearchOutcome, String> {
         .get("max_score")
         .and_then(Value::as_f64)
         .filter(|score| *score > 0.0)
-        .unwrap_or_else(|| {
-            hits.iter()
-                .map(|hit| hit.score)
-                .fold(0.0_f64, f64::max)
-        });
+        .unwrap_or_else(|| hits.iter().map(|hit| hit.score).fold(0.0_f64, f64::max));
     Ok(SearchOutcome {
         total,
         max_score,
@@ -312,19 +359,95 @@ fn with_auth(req: RequestBuilder, settings: &OpenSearchSettings) -> RequestBuild
     req
 }
 
-fn ensure_index(client: &Client, settings: &OpenSearchSettings) -> Result<(), String> {
+fn ensure_index(
+    client: &Client,
+    settings: &OpenSearchSettings,
+    log: &Sender<String>,
+) -> Result<(), String> {
     let url = format!("{}/{}", settings.base_url(), settings.index());
     let head = with_auth(client.head(&url), settings)
         .send()
         .map_err(|err| format!("インデックス確認に失敗しました: {err}"))?;
     if head.status().is_success() {
-        return Ok(());
+        return ensure_knn_on_existing(client, settings, log);
     }
 
+    let mapping = new_index_body();
+    let put = with_auth(client.put(&url), settings)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&mapping)
+        .send()
+        .map_err(|err| format!("インデックス作成に失敗しました: {err}"))?;
+    let status = put.status();
+    let body = put.text().unwrap_or_default();
+    if status.is_success() {
+        return Ok(());
+    }
+    if body.contains("resource_already_exists_exception") {
+        return ensure_knn_on_existing(client, settings, log);
+    }
+    Err(format!(
+        "インデックス '{}' を作成できません ({status}): {}",
+        settings.index(),
+        truncate(&body, 400)
+    ))
+}
+
+fn ensure_knn_on_existing(
+    client: &Client,
+    settings: &OpenSearchSettings,
+    log: &Sender<String>,
+) -> Result<(), String> {
+    let settings_url = format!("{}/{}/_settings", settings.base_url(), settings.index());
+    let knn_settings = json!({ "index": { "knn": true } });
+    match send_json(client, settings, &settings_url, &knn_settings) {
+        Ok(()) => {}
+        Err(err) => {
+            let _ = log.send(format!(
+                "既存インデックスの kNN 設定更新をスキップしました: {err}"
+            ));
+        }
+    }
+
+    let mapping_url = format!("{}/{}/_mapping", settings.base_url(), settings.index());
     let mapping = json!({
+        "properties": {
+            "embedding": knn_vector_property()
+        }
+    });
+    send_json(client, settings, &mapping_url, &mapping).map_err(|err| {
+        format!(
+            "既存インデックスにベクトルフィールドを追加できません。インデックスを削除して「PDFをOpenSearchに登録」をやり直してください: {err}"
+        )
+    })
+}
+
+fn send_json(
+    client: &Client,
+    settings: &OpenSearchSettings,
+    url: &str,
+    body: &Value,
+) -> Result<(), String> {
+    let put = with_auth(client.put(url), settings)
+        .header(CONTENT_TYPE, "application/json")
+        .json(body)
+        .send()
+        .map_err(|err| format!("OpenSearch への PUT に失敗しました: {err}"))?;
+    let status = put.status();
+    let text = put.text().unwrap_or_default();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("{status}: {}", truncate(&text, 400)))
+    }
+}
+
+pub fn new_index_body() -> Value {
+    json!({
         "settings": {
             "number_of_shards": 1,
-            "number_of_replicas": 0
+            "number_of_replicas": 0,
+            "knn": true
         },
         "mappings": {
             "properties": {
@@ -334,26 +457,27 @@ fn ensure_index(client: &Client, settings: &OpenSearchSettings) -> Result<(), St
                 "page": { "type": "integer" },
                 "chunk": { "type": "integer" },
                 "text": { "type": "text" },
-                "ingested_at": { "type": "date" }
+                "ingested_at": { "type": "date" },
+                "embedding": knn_vector_property()
             }
         }
-    });
+    })
+}
 
-    let put = with_auth(client.put(&url), settings)
-        .header(CONTENT_TYPE, "application/json")
-        .json(&mapping)
-        .send()
-        .map_err(|err| format!("インデックス作成に失敗しました: {err}"))?;
-    let status = put.status();
-    let body = put.text().unwrap_or_default();
-    if status.is_success() || body.contains("resource_already_exists_exception") {
-        return Ok(());
-    }
-    Err(format!(
-        "インデックス '{}' を作成できません ({status}): {}",
-        settings.index(),
-        truncate(&body, 400)
-    ))
+fn knn_vector_property() -> Value {
+    json!({
+        "type": "knn_vector",
+        "dimension": EMBEDDING_DIM,
+        "method": {
+            "name": "hnsw",
+            "engine": "lucene",
+            "space_type": "cosinesimil",
+            "parameters": {
+                "ef_construction": 100,
+                "m": 16
+            }
+        }
+    })
 }
 
 fn bulk_index(
@@ -361,8 +485,9 @@ fn bulk_index(
     settings: &OpenSearchSettings,
     batch: &[PdfChunk],
     ingested_at: &str,
+    embeddings: &[Vec<f32>],
 ) -> Result<usize, String> {
-    let body = build_bulk_body(settings.index(), batch, ingested_at);
+    let body = build_bulk_body(settings.index(), batch, ingested_at, embeddings);
     let url = format!("{}/_bulk", settings.base_url());
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -388,9 +513,14 @@ fn bulk_index(
     parse_bulk_indexed(&text, batch.len())
 }
 
-pub fn build_bulk_body(index: &str, batch: &[PdfChunk], ingested_at: &str) -> String {
+pub fn build_bulk_body(
+    index: &str,
+    batch: &[PdfChunk],
+    ingested_at: &str,
+    embeddings: &[Vec<f32>],
+) -> String {
     let mut body = String::new();
-    for chunk in batch {
+    for (i, chunk) in batch.iter().enumerate() {
         let id = document_id(chunk);
         let action = json!({
             "index": {
@@ -398,7 +528,7 @@ pub fn build_bulk_body(index: &str, batch: &[PdfChunk], ingested_at: &str) -> St
                 "_id": id
             }
         });
-        let source = json!({
+        let mut source = json!({
             "title": chunk.title,
             "file_name": chunk.file_name,
             "path": chunk.path,
@@ -407,6 +537,9 @@ pub fn build_bulk_body(index: &str, batch: &[PdfChunk], ingested_at: &str) -> St
             "text": chunk.text,
             "ingested_at": ingested_at,
         });
+        if let Some(embedding) = embeddings.get(i) {
+            source["embedding"] = json!(embedding);
+        }
         body.push_str(&action.to_string());
         body.push('\n');
         body.push_str(&source.to_string());
@@ -501,12 +634,47 @@ mod tests {
 
     #[test]
     fn bulk_body_is_ndjson() {
-        let body = build_bulk_body("pdf_docs", &[sample_chunk()], "2026-01-01T00:00:00Z");
+        let body = build_bulk_body(
+            "pdf_docs",
+            &[sample_chunk()],
+            "2026-01-01T00:00:00Z",
+            &[vec![0.1_f32, 0.2]],
+        );
         let lines: Vec<_> = body.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"index\""));
         assert!(lines[1].contains("hello world"));
+        assert!(lines[1].contains("\"embedding\""));
         assert!(body.ends_with('\n'));
+    }
+
+    #[test]
+    fn index_body_includes_knn_vector() {
+        let body = new_index_body();
+        assert_eq!(body["settings"]["knn"], true);
+        assert_eq!(
+            body["mappings"]["properties"]["embedding"]["type"],
+            "knn_vector"
+        );
+        assert_eq!(
+            body["mappings"]["properties"]["embedding"]["dimension"],
+            EMBEDDING_DIM
+        );
+    }
+
+    #[test]
+    fn knn_search_body_uses_vector() {
+        let body = knn_search_body(&[0.5, 0.25]);
+        assert_eq!(body["size"], SEARCH_SIZE);
+        assert_eq!(body["query"]["knn"]["embedding"]["k"], SEARCH_SIZE);
+        assert_eq!(
+            body["query"]["knn"]["embedding"]["vector"][0].as_f64(),
+            Some(0.5)
+        );
+        assert_eq!(
+            body["query"]["knn"]["embedding"]["vector"][1].as_f64(),
+            Some(0.25)
+        );
     }
 
     #[test]
@@ -623,12 +791,16 @@ mod tests {
         assert_eq!(outcome.total, 1);
         assert_eq!(outcome.hits[0].title, "a");
         assert!(outcome.hits[0].snippet.contains("hello"));
+
+        let knn = knn_search(&settings, "hello world meaning").unwrap();
+        assert_eq!(knn.total, 1);
+        assert_eq!(knn.hits[0].title, "a");
     }
 
     fn handle_mock_conn(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
         use std::io::{Read, Write};
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; 256 * 1024];
         let n = stream.read(&mut buf)?;
         if n == 0 {
             return Ok(());

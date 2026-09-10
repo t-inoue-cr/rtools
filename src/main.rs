@@ -1,3 +1,4 @@
+mod embedding;
 mod opensearch;
 mod pdf;
 mod settings;
@@ -30,7 +31,7 @@ enum IngestState {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 690.0])
+            .with_inner_size([880.0, 800.0])
             .with_title("rtools"),
         ..Default::default()
     };
@@ -150,6 +151,21 @@ fn install_japanese_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+#[derive(Clone, Copy)]
+enum SearchKind {
+    Keyword,
+    Sentence,
+}
+
+impl SearchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyword => "キーワード検索（BM25）",
+            Self::Sentence => "文章検索（kNN）",
+        }
+    }
+}
+
 struct RToolsApp {
     log: String,
     log_tx: Sender<String>,
@@ -163,7 +179,9 @@ struct RToolsApp {
     write_rx: Option<Receiver<Result<PathBuf, String>>>,
     ingest_rx: Option<Receiver<Result<IngestReport, String>>>,
     search_rx: Option<Receiver<Result<SearchOutcome, String>>>,
+    search_kind: SearchKind,
     search_query: String,
+    sentence_query: String,
     search_hits: Vec<SearchHit>,
     search_max_score: f64,
     search_status: String,
@@ -202,7 +220,9 @@ impl RToolsApp {
             write_rx: None,
             ingest_rx: None,
             search_rx: None,
+            search_kind: SearchKind::Keyword,
             search_query: String::new(),
+            sentence_query: String::new(),
             search_hits: Vec::new(),
             search_max_score: 0.0,
             search_status: "検索結果はここに表示されます。".into(),
@@ -269,10 +289,14 @@ impl RToolsApp {
         self.yield_before_action = true;
     }
 
-    fn start_search(&mut self) {
-        let query = self.search_query.trim().to_string();
+    fn start_search(&mut self, kind: SearchKind, query: String) {
+        let query = query.trim().to_string();
         if query.is_empty() {
-            self.log_line("検索キーワードを入力してください。");
+            let msg = match kind {
+                SearchKind::Keyword => "検索キーワードを入力してください。",
+                SearchKind::Sentence => "検索する文章を入力してください。",
+            };
+            self.log_line(msg);
             return;
         }
 
@@ -281,7 +305,14 @@ impl RToolsApp {
             None => return,
         };
 
-        self.log_line(format!("検索しています: {query}"));
+        self.search_kind = kind;
+        let preview = search_query_preview(&query);
+        self.log_line(format!("{}しています: {preview}", kind.label()));
+        if matches!(kind, SearchKind::Sentence) {
+            self.log_line(
+                "埋め込みモデルを準備しています（初回は約 120MB のダウンロードがあります）。",
+            );
+        }
         self.search_status = "検索中…".into();
         let (tx, rx) = mpsc::channel();
         self.search_rx = Some(rx);
@@ -290,7 +321,10 @@ impl RToolsApp {
         std::thread::Builder::new()
             .name("opensearch-search".into())
             .spawn(move || {
-                let result = opensearch::search(&settings, &query);
+                let result = match kind {
+                    SearchKind::Keyword => opensearch::search(&settings, &query),
+                    SearchKind::Sentence => opensearch::knn_search(&settings, &query),
+                };
                 if let Err(err) = &result {
                     let _ = log_tx.send(format!("検索に失敗しました: {err}"));
                 }
@@ -356,7 +390,8 @@ impl RToolsApp {
                 self.search_max_score = outcome.max_score;
                 self.search_hits = outcome.hits;
                 self.search_status = format!(
-                    "{} 件ヒット（表示 {} 件）",
+                    "{}: {} 件ヒット（表示 {} 件）",
+                    self.search_kind.label(),
                     outcome.total,
                     self.search_hits.len()
                 );
@@ -648,9 +683,10 @@ impl eframe::App for RToolsApp {
         let follow_bottom = self.log_follow_bottom;
         let busy_hint = self.busy_hint();
         let can_search = idle && !self.search_query.trim().is_empty();
+        let can_sentence_search = idle && !self.sentence_query.trim().is_empty();
 
         egui::TopBottomPanel::top("toolbar")
-            .min_height(108.0)
+            .min_height(248.0)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(16, 12)),
@@ -678,10 +714,12 @@ impl eframe::App for RToolsApp {
                     }
                 });
 
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("キーワード検索（BM25）").strong());
+                ui.weak("語句が一致する文書を探します。単語や短いフレーズを入力してください。");
                 ui.horizontal(|ui| {
-                    ui.label("検索キーワード");
                     let edit = egui::TextEdit::singleline(&mut self.search_query)
-                        .desired_width(320.0)
+                        .desired_width(420.0)
                         .hint_text("キーワードを入力")
                         .margin(egui::Margin {
                             left: 4,
@@ -700,7 +738,28 @@ impl eframe::App for RToolsApp {
                         .fill(egui::Color32::from_rgb(232, 240, 254));
                     if ui.add_enabled(can_search, search_button).clicked() || (enter && can_search)
                     {
-                        self.start_search();
+                        self.start_search(SearchKind::Keyword, self.search_query.clone());
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("文章検索（ベクトル / kNN）").strong());
+                ui.weak(
+                    "意味が近い文書を探します。キーワードではなく、探したい内容を文章で入力してください。",
+                );
+                ui.horizontal(|ui| {
+                    let edit = egui::TextEdit::multiline(&mut self.sentence_query)
+                        .desired_width(420.0)
+                        .desired_rows(3)
+                        .hint_text("探したい内容を文章で入力");
+                    ui.add_enabled(idle, edit);
+
+                    let search_button = egui::Button::new("文章検索")
+                        .min_size(egui::vec2(0.0, 40.0))
+                        .corner_radius(6.0)
+                        .fill(egui::Color32::from_rgb(232, 240, 254));
+                    if ui.add_enabled(can_sentence_search, search_button).clicked() {
+                        self.start_search(SearchKind::Sentence, self.sentence_query.clone());
                     }
                 });
             });
@@ -781,6 +840,17 @@ impl eframe::App for RToolsApp {
         });
 
         self.log_len_shown = self.log.len();
+    }
+}
+
+fn search_query_preview(query: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut chars = query.chars();
+    let taken: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{taken}…")
+    } else {
+        taken
     }
 }
 

@@ -4,6 +4,14 @@
 //! 探索順: 実行ファイルと同じフォルダ → カレントディレクトリ。
 //!
 //! パスワードや API キーは Git にコミットしないでください。
+//!
+//! 検索は 2 種類です。
+//! - キーワード検索（BM25）: 語句一致
+//! - 文章検索（ベクトル / kNN）: アプリ側の multilingual-e5-small で埋め込み、
+//!   OpenSearch の knn_vector で近傍検索（クラスタに k-NN プラグインが必要）
+//! 文章検索を使うには PDF の再登録が必要です。埋め込みモデルは初回に約 120MB
+//! ダウンロードされ、%LOCALAPPDATA%\rtools\models（Linux は ~/.cache/rtools/models）
+//! にキャッシュされます。
 
 [opensearch]
 # 接続 URL。指定すると host / port / scheme より優先されます。
