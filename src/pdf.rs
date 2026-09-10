@@ -1,0 +1,310 @@
+use std::fs;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+
+use pdf_oxide::api::Pdf;
+
+/// OpenSearch に登録する 1 チャンク（ページ内のテキスト断片）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfChunk {
+    pub path: String,
+    pub file_name: String,
+    pub title: String,
+    pub page: u32,
+    pub chunk: u32,
+    pub text: String,
+}
+
+const TARGET_CHARS: usize = 1800;
+const OVERLAP_CHARS: usize = 120;
+
+/// フォルダ以下の PDF を再帰的に集める（隠しディレクトリはスキップ）。
+pub fn collect_pdfs(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    walk_pdfs(root, &mut out, 0)?;
+    out.sort();
+    Ok(out)
+}
+
+fn walk_pdfs(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<(), String> {
+    if depth > 12 {
+        return Ok(());
+    }
+    if out.len() >= 2000 {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            walk_pdfs(&path, out, depth + 1)?;
+        } else if file_type.is_file() && is_pdf(&path) {
+            out.push(path);
+            if out.len() >= 2000 {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
+
+/// PDF からテキストを抽出し、ページ（フォームフィード）または文字数でチャンク化する。
+pub fn structure_pdf(path: &Path) -> Result<Vec<PdfChunk>, String> {
+    let text = extract_text(path)?;
+    Ok(chunks_from_text(path, &text))
+}
+
+fn extract_text(path: &Path) -> Result<String, String> {
+    let path_owned = path.to_path_buf();
+    let caught = panic::catch_unwind(AssertUnwindSafe(|| extract_with_pdf_oxide(&path_owned)));
+    match caught {
+        Ok(Ok(text)) if !text.trim().is_empty() => Ok(text),
+        Ok(Ok(_)) => Err(format_extraction_error(path, "テキストが空でした")),
+        Ok(Err(err)) => Err(format_extraction_error(path, &err)),
+        Err(payload) => Err(format_extraction_error(path, &panic_to_string(payload))),
+    }
+}
+
+fn extract_with_pdf_oxide(path: &Path) -> Result<String, String> {
+    let mut doc = Pdf::open(path).map_err(|err| format!("PDF を開けません: {err}"))?;
+    let page_count = doc
+        .page_count()
+        .map_err(|err| format!("ページ数を取得できません: {err}"))?;
+    if page_count == 0 {
+        return Err("ページがありません".into());
+    }
+
+    let mut pages = Vec::with_capacity(page_count);
+    for i in 0..page_count {
+        let text = doc
+            .to_text(i)
+            .map_err(|err| format!("ページ {} の抽出に失敗しました: {err}", i + 1))?;
+        pages.push(text);
+    }
+    Ok(pages.join("\u{c}"))
+}
+
+fn format_extraction_error(path: &Path, detail: &str) -> String {
+    format!(
+        "{}: PDF のテキスト抽出に失敗しました。{detail}",
+        path.display()
+    )
+}
+
+fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "PDF 解析中にパニックしました".into()
+    }
+}
+
+pub fn chunks_from_text(path: &Path, text: &str) -> Vec<PdfChunk> {
+    let path_str = path.display().to_string();
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path_str.clone());
+    let title = path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_name.clone());
+
+    let pages: Vec<&str> = if text.contains('\u{c}') {
+        text.split('\u{c}').collect()
+    } else {
+        vec![text]
+    };
+
+    let mut docs = Vec::new();
+    for (page_i, page_text) in pages.iter().enumerate() {
+        let page = (page_i + 1) as u32;
+        let pieces = split_chunks(page_text);
+        if pieces.is_empty() {
+            continue;
+        }
+        for (chunk_i, piece) in pieces.into_iter().enumerate() {
+            docs.push(PdfChunk {
+                path: path_str.clone(),
+                file_name: file_name.clone(),
+                title: title.clone(),
+                page,
+                chunk: (chunk_i + 1) as u32,
+                text: piece,
+            });
+        }
+    }
+
+    if docs.is_empty() {
+        docs.push(PdfChunk {
+            path: path_str,
+            file_name,
+            title,
+            page: 1,
+            chunk: 1,
+            text: "(テキストを抽出できませんでした)".into(),
+        });
+    }
+    docs
+}
+
+fn split_chunks(text: &str) -> Vec<String> {
+    let normalized = collapse_ws(text);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    if normalized.chars().count() <= TARGET_CHARS {
+        return vec![normalized];
+    }
+
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let mut end = (start + TARGET_CHARS).min(chars.len());
+        if end < chars.len() {
+            let window_start = start + TARGET_CHARS / 2;
+            if let Some(rel) = chars[window_start..end]
+                .iter()
+                .rposition(|c| *c == '。' || *c == '\n' || *c == '.')
+            {
+                end = window_start + rel + 1;
+            }
+        }
+        let piece: String = chars[start..end].iter().collect();
+        let piece = piece.trim().to_string();
+        if !piece.is_empty() {
+            out.push(piece);
+        }
+        if end >= chars.len() {
+            break;
+        }
+        start = end.saturating_sub(OVERLAP_CHARS);
+        if start >= end {
+            start = end;
+        }
+    }
+    out
+}
+
+fn collapse_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = true;
+    for ch in text.chars() {
+        if ch == '\u{c}' {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(if ch == '\n' { '\n' } else { ' ' });
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunks_short_text_as_one() {
+        let path = Path::new("/docs/report.pdf");
+        let docs = chunks_from_text(path, "これはテストです。");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].title, "report");
+        assert_eq!(docs[0].file_name, "report.pdf");
+        assert_eq!(docs[0].page, 1);
+        assert_eq!(docs[0].chunk, 1);
+        assert!(docs[0].text.contains("テスト"));
+    }
+
+    #[test]
+    fn splits_form_feed_as_pages() {
+        let path = Path::new("a.pdf");
+        let docs = chunks_from_text(path, "page-one\u{c}page-two");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].page, 1);
+        assert_eq!(docs[0].text, "page-one");
+        assert_eq!(docs[1].page, 2);
+        assert_eq!(docs[1].text, "page-two");
+    }
+
+    #[test]
+    fn empty_text_gets_placeholder() {
+        let docs = chunks_from_text(Path::new("empty.pdf"), "   \n\t");
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].text.contains("抽出できませんでした"));
+    }
+
+    #[test]
+    fn splits_long_text() {
+        let long = "あ".repeat(TARGET_CHARS + 200);
+        let docs = chunks_from_text(Path::new("long.pdf"), &long);
+        assert!(docs.len() >= 2);
+        assert_eq!(docs[0].chunk, 1);
+        assert_eq!(docs[1].chunk, 2);
+    }
+
+    #[test]
+    fn detects_pdf_extension() {
+        assert!(is_pdf(Path::new("a.PDF")));
+        assert!(!is_pdf(Path::new("a.txt")));
+    }
+
+    #[test]
+    fn extraction_error_is_japanese() {
+        let err = format_extraction_error(Path::new("C:\\patents\\jp.pdf"), "ページがありません");
+        assert!(err.contains("テキスト抽出に失敗しました"));
+        assert!(err.contains("jp.pdf"));
+        assert!(err.contains("ページがありません"));
+    }
+
+    #[test]
+    fn panic_payload_keeps_message() {
+        let msg = panic_to_string(Box::new("parse failed"));
+        assert_eq!(msg, "parse failed");
+        let msg = panic_to_string(Box::new("owned".to_string()));
+        assert_eq!(msg, "owned");
+    }
+
+    #[test]
+    fn pdf_oxide_extracts_fixture_pages() {
+        let dir = std::env::temp_dir().join(format!("rtools-pdf-oxide-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("hello.pdf");
+        fs::write(&pdf, include_bytes!("../tests/fixtures/hello.pdf")).unwrap();
+        let text = extract_text(&pdf).expect("pdf_oxide extraction");
+        assert!(
+            text.contains("HelloPdfOxide"),
+            "unexpected extracted text: {text:?}"
+        );
+        let chunks = structure_pdf(&pdf).expect("structure");
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().any(|c| c.text.contains("HelloPdfOxide")));
+        let _ = fs::remove_file(&pdf);
+        let _ = fs::remove_dir(&dir);
+    }
+}
