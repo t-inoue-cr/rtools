@@ -13,6 +13,10 @@ use crate::settings::OpenSearchSettings;
 const BULK_BATCH: usize = 80;
 const SEARCH_SIZE: usize = 50;
 
+/// OpenSearch highlight 用の内部マーカー。UI で背景色に変換する。
+pub const HIGHLIGHT_PRE: &str = "<mark>";
+pub const HIGHLIGHT_POST: &str = "</mark>";
+
 #[derive(Debug, Clone)]
 pub struct IngestReport {
     pub files_ok: usize,
@@ -148,8 +152,8 @@ pub fn search(settings: &OpenSearchSettings, query: &str) -> Result<SearchOutcom
             }
         },
         "highlight": {
-            "pre_tags": ["【"],
-            "post_tags": ["】"],
+            "pre_tags": [HIGHLIGHT_PRE],
+            "post_tags": [HIGHLIGHT_POST],
             "fields": {
                 "text": {
                     "fragment_size": 160,
@@ -221,6 +225,33 @@ fn parse_hit(hit: &Value) -> SearchHit {
         page,
         snippet,
     }
+}
+
+/// スニペットを「強調 / 通常」の断片に分ける。
+pub fn snippet_segments(snippet: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let mut rest = snippet;
+    let mut highlighted = false;
+    loop {
+        let needle = if highlighted {
+            HIGHLIGHT_POST
+        } else {
+            HIGHLIGHT_PRE
+        };
+        if let Some(i) = rest.find(needle) {
+            if i > 0 {
+                out.push((highlighted, &rest[..i]));
+            }
+            rest = &rest[i + needle.len()..];
+            highlighted = !highlighted;
+        } else {
+            if !rest.is_empty() {
+                out.push((highlighted, rest));
+            }
+            break;
+        }
+    }
+    out
 }
 
 fn highlight_snippet(hit: &Value) -> Option<String> {
@@ -490,7 +521,7 @@ mod tests {
                             "page": 3,
                             "text": "長い本文"
                         },
-                        "highlight": { "text": ["【キーワード】を含む"] }
+                        "highlight": { "text": ["<mark>キーワード</mark>を含む"] }
                     }
                 ]
             }
@@ -501,6 +532,20 @@ mod tests {
         assert_eq!(out.hits[0].title, "仕様書");
         assert_eq!(out.hits[0].page, 3);
         assert!(out.hits[0].snippet.contains("キーワード"));
+        assert_eq!(
+            snippet_segments(&out.hits[0].snippet),
+            vec![(true, "キーワード"), (false, "を含む")]
+        );
+    }
+
+    #[test]
+    fn splits_highlight_markers() {
+        let snippet = format!("{HIGHLIGHT_PRE}hello{HIGHLIGHT_POST} world");
+        assert_eq!(
+            snippet_segments(&snippet),
+            vec![(true, "hello"), (false, " world")]
+        );
+        assert_eq!(snippet_segments("plain"), vec![(false, "plain")]);
     }
 
     #[test]
@@ -562,7 +607,7 @@ mod tests {
         let body = if first.starts_with("POST /_bulk") {
             r#"{"errors":false,"items":[{"index":{"status":201}}]}"#
         } else if first.contains("/_search") {
-            r#"{"hits":{"total":{"value":1},"hits":[{"_score":1.0,"_source":{"title":"a","path":"/tmp/a.pdf","page":1,"text":"hello world"},"highlight":{"text":["【hello】 world"]}}]}}"#
+            r#"{"hits":{"total":{"value":1},"hits":[{"_score":1.0,"_source":{"title":"a","path":"/tmp/a.pdf","page":1,"text":"hello world"},"highlight":{"text":["<mark>hello</mark> world"]}}]}}"#
         } else if first.starts_with("PUT ") {
             r#"{"acknowledged":true}"#
         } else {

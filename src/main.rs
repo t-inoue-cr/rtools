@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use opensearch::{IngestReport, SearchHit, SearchOutcome};
+use opensearch::{IngestReport, SearchHit, SearchOutcome, snippet_segments};
 use pdf::collect_pdfs;
 use settings::OpenSearchSettings;
 
@@ -30,7 +30,7 @@ enum IngestState {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 640.0])
+            .with_inner_size([880.0, 690.0])
             .with_title("rtools"),
         ..Default::default()
     };
@@ -677,6 +677,12 @@ impl eframe::App for RToolsApp {
                     let edit = egui::TextEdit::singleline(&mut self.search_query)
                         .desired_width(320.0)
                         .hint_text("キーワードを入力")
+                        .margin(egui::Margin {
+                            left: 4,
+                            right: 4,
+                            top: 6,
+                            bottom: 2,
+                        })
                         .min_size(egui::vec2(0.0, 32.0));
                     let response = ui.add_enabled(idle, edit);
                     let enter =
@@ -693,82 +699,109 @@ impl eframe::App for RToolsApp {
                 });
             });
 
-        egui::TopBottomPanel::bottom("search-results")
+        egui::TopBottomPanel::bottom("log")
             .resizable(true)
-            .default_height(200.0)
-            .min_height(120.0)
+            .default_height(150.0)
+            .min_height(80.0)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("検索結果").strong());
-                ui.label(&self.search_status);
+                ui.label(egui::RichText::new("ログ").strong());
                 egui::Frame::new()
                     .fill(ui.visuals().extreme_bg_color)
                     .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_gray(80)))
                     .corner_radius(6.0)
                     .inner_margin(egui::Margin::symmetric(8, 8))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("search-hits")
+                        let log_grew = self.log.len() != self.log_len_shown;
+                        let output = egui::ScrollArea::vertical()
+                            .id_salt("log")
                             .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .animated(false)
                             .show(ui, |ui| {
-                                if self.search_hits.is_empty() {
-                                    ui.label("ヒットはありません。");
-                                    return;
-                                }
-                                for hit in &self.search_hits {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{:.2}", hit.score));
-                                        ui.strong(&hit.title);
-                                        ui.label(format!("p.{}", hit.page));
-                                    });
-                                    if !hit.path.is_empty() {
-                                        ui.weak(&hit.path);
-                                    }
-                                    if !hit.snippet.is_empty() {
-                                        ui.label(&hit.snippet);
-                                    }
-                                    ui.separator();
+                                ui.add(egui::Label::new(&self.log).wrap().selectable(true));
+                                if log_grew && follow_bottom {
+                                    ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+                                        .scroll_to_me(Some(egui::Align::BOTTOM));
                                 }
                             });
+                        let max_offset =
+                            (output.content_size.y - output.inner_rect.height()).max(0.0);
+                        let at_bottom = output.state.offset.y >= max_offset - 1.0;
+                        self.log_follow_bottom = if log_grew && follow_bottom {
+                            true
+                        } else {
+                            at_bottom
+                        };
                     });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(egui::RichText::new("ログ").strong());
+            ui.label(egui::RichText::new("検索結果").strong());
+            ui.label(&self.search_status);
             egui::Frame::new()
                 .fill(ui.visuals().extreme_bg_color)
                 .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_gray(80)))
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(8, 8))
                 .show(ui, |ui| {
-                    let log_grew = self.log.len() != self.log_len_shown;
-                    let output = egui::ScrollArea::vertical()
-                        .id_salt("log")
+                    egui::ScrollArea::vertical()
+                        .id_salt("search-hits")
                         .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .animated(false)
                         .show(ui, |ui| {
-                            ui.add(egui::Label::new(&self.log).wrap().selectable(true));
-                            if log_grew && follow_bottom {
-                                ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
-                                    .scroll_to_me(Some(egui::Align::BOTTOM));
+                            if self.search_hits.is_empty() {
+                                ui.label("ヒットはありません。");
+                                return;
+                            }
+                            for hit in &self.search_hits {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{:.2}", hit.score));
+                                    ui.strong(&hit.title);
+                                    ui.label(format!("p.{}", hit.page));
+                                });
+                                if !hit.path.is_empty() {
+                                    ui.weak(&hit.path);
+                                }
+                                if !hit.snippet.is_empty() {
+                                    show_highlighted_snippet(ui, &hit.snippet);
+                                }
+                                ui.separator();
                             }
                         });
-                    let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
-                    let at_bottom = output.state.offset.y >= max_offset - 1.0;
-                    self.log_follow_bottom = if log_grew && follow_bottom {
-                        true
-                    } else {
-                        at_bottom
-                    };
                 });
         });
 
         self.log_len_shown = self.log.len();
     }
+}
+
+fn show_highlighted_snippet(ui: &mut egui::Ui, snippet: &str) {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let text_color = ui.visuals().text_color();
+    let highlight = egui::Color32::from_rgb(255, 145, 0);
+    for (is_hit, part) in snippet_segments(snippet) {
+        let format = if is_hit {
+            egui::text::TextFormat {
+                font_id: font_id.clone(),
+                color: egui::Color32::from_gray(20),
+                background: highlight,
+                ..Default::default()
+            }
+        } else {
+            egui::text::TextFormat {
+                font_id: font_id.clone(),
+                color: text_color,
+                ..Default::default()
+            }
+        };
+        job.append(part, 0.0, format);
+    }
+    ui.add(egui::Label::new(job).wrap().selectable(true));
 }
 
 fn format_log_line(msg: &str) -> String {
