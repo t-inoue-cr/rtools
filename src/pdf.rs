@@ -4,6 +4,13 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use pdf_oxide::api::Pdf;
+use pdf_oxide::layout::TextLine;
+use pdf_oxide::structure::Table;
+
+use crate::pdf_layout::{
+    LayoutLine, LayoutTable, PageBlock, blocks_to_markdown, blocks_to_plain, join_fragments,
+    reconstruct_page,
+};
 
 /// OpenSearch に登録する 1 チャンク（ページ内のテキスト断片）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,8 +101,13 @@ fn markdown_from_pdf(path: &Path) -> Result<String, String> {
     let mut out = String::new();
     push_markdown_title(&mut out, path);
     let mut wrote_page = false;
-    for_each_pdf_page(path, |page, text| {
-        push_markdown_page(&mut out, &mut wrote_page, page, &text);
+    for_each_page_blocks(path, |page, blocks| {
+        push_markdown_page(
+            &mut out,
+            &mut wrote_page,
+            page,
+            &blocks_to_markdown(&blocks),
+        );
         Ok(())
     })?;
     if !wrote_page {
@@ -110,7 +122,12 @@ fn markdown_from_text(path: &Path, text: &str) -> String {
     push_markdown_title(&mut out, path);
     let mut wrote_page = false;
     for (i, page) in text.split('\u{c}').enumerate() {
-        push_markdown_page(&mut out, &mut wrote_page, (i + 1) as u32, page);
+        push_markdown_page(
+            &mut out,
+            &mut wrote_page,
+            (i + 1) as u32,
+            &collapse_ws(page),
+        );
     }
     out
 }
@@ -123,17 +140,18 @@ fn push_markdown_title(out: &mut String, path: &Path) {
     let _ = write!(out, "# {title}\n\n");
 }
 
-fn push_markdown_page(out: &mut String, wrote_page: &mut bool, page: u32, text: &str) {
-    let body = collapse_ws(text);
-    if body.is_empty() {
+fn push_markdown_page(out: &mut String, wrote_page: &mut bool, page: u32, body: &str) {
+    if body.trim().is_empty() {
         return;
     }
     if *wrote_page {
         out.push('\n');
     }
     let _ = write!(out, "## ページ {page}\n\n");
-    out.push_str(&body);
-    out.push('\n');
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
     *wrote_page = true;
 }
 
@@ -150,16 +168,16 @@ fn extract_text(path: &Path) -> Result<String, String> {
 
 fn extract_with_pdf_oxide(path: &Path) -> Result<String, String> {
     let mut pages = Vec::new();
-    for_each_pdf_page(path, |_, text| {
-        pages.push(text);
+    for_each_page_blocks(path, |_, blocks| {
+        pages.push(blocks_to_plain(&blocks));
         Ok(())
     })?;
     Ok(pages.join("\u{c}"))
 }
 
-fn for_each_pdf_page(
+fn for_each_page_blocks(
     path: &Path,
-    mut on_page: impl FnMut(u32, String) -> Result<(), String>,
+    mut on_page: impl FnMut(u32, Vec<PageBlock>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut doc = Pdf::open(path).map_err(|err| format!("PDF を開けません: {err}"))?;
     let page_count = doc
@@ -170,12 +188,108 @@ fn for_each_pdf_page(
     }
 
     for i in 0..page_count {
-        let text = doc
-            .to_text(i)
-            .map_err(|err| format!("ページ {} の抽出に失敗しました: {err}", i + 1))?;
-        on_page((i + 1) as u32, text)?;
+        if let Some(blocks) = extract_page_blocks(&mut doc, i)? {
+            on_page((i + 1) as u32, blocks)?;
+        }
     }
     Ok(())
+}
+
+fn extract_page_blocks(doc: &mut Pdf, index: usize) -> Result<Option<Vec<PageBlock>>, String> {
+    let lines = match doc.extract_text_lines(index) {
+        Ok(lines) if !lines.is_empty() => lines,
+        Ok(_) | Err(_) => return fallback_page_blocks(doc, index),
+    };
+    let tables = doc.extract_tables(index).unwrap_or_default();
+    let layout_lines: Vec<LayoutLine> = lines.into_iter().map(layout_line_from_pdf).collect();
+    let layout_tables: Vec<LayoutTable> = tables.iter().filter_map(layout_table_from_pdf).collect();
+    let blocks = reconstruct_page(layout_lines, layout_tables);
+    if blocks.is_empty() {
+        return fallback_page_blocks(doc, index);
+    }
+    Ok(Some(blocks))
+}
+
+fn fallback_page_blocks(doc: &mut Pdf, index: usize) -> Result<Option<Vec<PageBlock>>, String> {
+    let page_no = index + 1;
+    let text = doc
+        .to_text(index)
+        .map_err(|err| format!("ページ {page_no} の抽出に失敗しました: {err}"))?;
+    let body = collapse_ws(&text);
+    if body.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(vec![PageBlock::Paragraph(body)]))
+    }
+}
+
+fn layout_line_from_pdf(line: TextLine) -> LayoutLine {
+    let font_size = if line.words.is_empty() {
+        line.bbox.height.max(1.0)
+    } else {
+        let sum: f32 = line.words.iter().map(|word| word.avg_font_size).sum();
+        (sum / line.words.len() as f32).max(1.0)
+    };
+    let text = if line.words.is_empty() {
+        line.text
+    } else {
+        join_fragments(line.words.iter().map(|word| word.text.as_str()))
+    };
+    LayoutLine {
+        text,
+        x: line.bbox.x,
+        y: line.bbox.y,
+        width: line.bbox.width,
+        height: line.bbox.height,
+        font_size,
+        heading_level: None,
+    }
+}
+
+fn layout_table_from_pdf(table: &Table) -> Option<LayoutTable> {
+    if !table.is_real_grid() {
+        return None;
+    }
+    let bbox = table.bbox?;
+    let col_count = table.col_count.max(
+        table
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.colspan.max(1) as usize)
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0),
+    );
+    let mut rows = Vec::new();
+    for row in &table.rows {
+        let mut cells = Vec::new();
+        for cell in &row.cells {
+            cells.push(cell.text.clone());
+            for _ in 1..cell.colspan.max(1) {
+                cells.push(String::new());
+            }
+        }
+        while cells.len() < col_count {
+            cells.push(String::new());
+        }
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+    let has_header =
+        table.has_header || table.rows.first().map(|row| row.is_header).unwrap_or(false);
+    Some(LayoutTable {
+        x: bbox.x,
+        y: bbox.y,
+        width: bbox.width,
+        height: bbox.height,
+        rows,
+        has_header,
+    })
 }
 
 fn format_extraction_error(path: &Path, detail: &str) -> String {
@@ -370,7 +484,10 @@ mod tests {
 
     #[test]
     fn markdown_file_name_uses_stem() {
-        assert_eq!(markdown_file_name(Path::new("/docs/report.pdf")), "report.md");
+        assert_eq!(
+            markdown_file_name(Path::new("/docs/report.pdf")),
+            "report.md"
+        );
         assert_eq!(markdown_file_name(Path::new("a.PDF")), "a.md");
         assert_eq!(markdown_file_name(Path::new("noext")), "noext.md");
     }
@@ -405,10 +522,7 @@ mod tests {
         fs::write(&pdf, include_bytes!("../tests/fixtures/hello.pdf")).unwrap();
         let md = pdf_to_markdown(&pdf).expect("pdf_to_markdown");
         assert!(md.starts_with("# hello\n\n"), "unexpected markdown: {md:?}");
-        assert!(
-            md.contains("HelloPdfOxide"),
-            "unexpected markdown: {md:?}"
-        );
+        assert!(md.contains("HelloPdfOxide"), "unexpected markdown: {md:?}");
         let _ = fs::remove_file(&pdf);
         let _ = fs::remove_dir(&dir);
     }

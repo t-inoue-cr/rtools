@@ -1,6 +1,7 @@
 mod embedding;
 mod opensearch;
 mod pdf;
+mod pdf_layout;
 mod settings;
 
 use std::fs;
@@ -35,7 +36,10 @@ enum ConvertState {
         file_name: String,
         rx: Receiver<Result<String, String>>,
     },
-    PickSave { markdown: String, file_name: String },
+    PickSave {
+        markdown: String,
+        file_name: String,
+    },
     Writing(Receiver<Result<PathBuf, String>>),
 }
 
