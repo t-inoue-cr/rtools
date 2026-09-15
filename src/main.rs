@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use opensearch::{IngestReport, SearchHit, SearchOutcome, snippet_segments};
-use pdf::collect_pdfs;
+use pdf::{collect_pdfs, markdown_file_name, pdf_to_markdown};
 use settings::OpenSearchSettings;
 
 enum ExportState {
@@ -26,6 +26,17 @@ enum IngestState {
     Idle,
     PickFolder,
     Running,
+}
+
+enum ConvertState {
+    Idle,
+    PickPdf,
+    Converting {
+        file_name: String,
+        rx: Receiver<Result<String, String>>,
+    },
+    PickSave { markdown: String, file_name: String },
+    Writing(Receiver<Result<PathBuf, String>>),
 }
 
 fn main() -> eframe::Result {
@@ -174,6 +185,7 @@ struct RToolsApp {
     log_len_shown: usize,
     export: ExportState,
     ingest: IngestState,
+    convert: ConvertState,
     yield_before_action: bool,
     list_rx: Option<Receiver<Result<Vec<String>, String>>>,
     write_rx: Option<Receiver<Result<PathBuf, String>>>,
@@ -215,6 +227,7 @@ impl RToolsApp {
             log_len_shown: 0,
             export: ExportState::Idle,
             ingest: IngestState::Idle,
+            convert: ConvertState::Idle,
             yield_before_action: false,
             list_rx: None,
             write_rx: None,
@@ -262,6 +275,7 @@ impl RToolsApp {
     fn is_idle(&self) -> bool {
         matches!(self.export, ExportState::Idle)
             && matches!(self.ingest, IngestState::Idle)
+            && matches!(self.convert, ConvertState::Idle)
             && self.search_rx.is_none()
     }
 
@@ -270,6 +284,8 @@ impl RToolsApp {
             Some("ファイル一覧を処理中…")
         } else if !matches!(self.ingest, IngestState::Idle) {
             Some("PDFを登録中…")
+        } else if !matches!(self.convert, ConvertState::Idle) {
+            Some("PDFを変換中…")
         } else if self.search_rx.is_some() {
             Some("検索中…")
         } else {
@@ -286,6 +302,12 @@ impl RToolsApp {
     fn start_ingest(&mut self) {
         self.log_line("PDF フォルダの選択ダイアログを開きます。");
         self.ingest = IngestState::PickFolder;
+        self.yield_before_action = true;
+    }
+
+    fn start_convert(&mut self) {
+        self.log_line("PDF の選択ダイアログを開きます。");
+        self.convert = ConvertState::PickPdf;
         self.yield_before_action = true;
     }
 
@@ -373,6 +395,24 @@ impl RToolsApp {
         }
         if matches!(self.ingest, IngestState::Running) {
             self.poll_ingest_worker(ctx);
+        }
+    }
+
+    fn poll_convert(&mut self, ctx: &egui::Context) {
+        match &self.convert {
+            ConvertState::Idle => {}
+            ConvertState::PickPdf => {
+                if !self.yield_before_action {
+                    self.pick_pdf();
+                }
+            }
+            ConvertState::Converting { .. } => self.poll_converting(ctx),
+            ConvertState::PickSave { .. } => {
+                if !self.yield_before_action {
+                    self.pick_convert_save();
+                }
+            }
+            ConvertState::Writing(_) => self.poll_convert_writing(ctx),
         }
     }
 
@@ -635,6 +675,135 @@ impl RToolsApp {
             }
         }
     }
+
+    fn pick_pdf(&mut self) {
+        self.convert = ConvertState::Idle;
+        let Some(pdf_path) = rfd::FileDialog::new()
+            .set_title("PDFを選択")
+            .add_filter("PDF", &["pdf"])
+            .pick_file()
+        else {
+            self.log_line("PDF の選択をキャンセルしました。");
+            return;
+        };
+
+        self.log_line(format!("PDF: {}", pdf_path.display()));
+        self.log_line("Markdown に変換しています。");
+        self.start_converting(pdf_path);
+    }
+
+    fn start_converting(&mut self, pdf_path: PathBuf) {
+        let file_name = markdown_file_name(&pdf_path);
+        let (tx, rx) = mpsc::channel();
+        self.convert = ConvertState::Converting { file_name, rx };
+
+        std::thread::Builder::new()
+            .name("pdf-to-markdown".into())
+            .spawn(move || {
+                let _ = tx.send(pdf_to_markdown(&pdf_path));
+            })
+            .expect("failed to spawn pdf-to-markdown thread");
+    }
+
+    fn poll_converting(&mut self, ctx: &egui::Context) {
+        let recv = match &self.convert {
+            ConvertState::Converting { rx, .. } => rx.try_recv(),
+            _ => return,
+        };
+
+        match recv {
+            Ok(result) => {
+                let ConvertState::Converting { file_name, .. } =
+                    std::mem::replace(&mut self.convert, ConvertState::Idle)
+                else {
+                    return;
+                };
+                match result {
+                    Ok(markdown) => {
+                        self.log_line("保存先の選択ダイアログを開きます。");
+                        self.convert = ConvertState::PickSave {
+                            markdown,
+                            file_name,
+                        };
+                        self.yield_before_action = true;
+                    }
+                    Err(err) => {
+                        self.log_line(format!("PDF の変換に失敗しました: {err}"));
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.convert = ConvertState::Idle;
+                self.log_line("PDF の変換に失敗しました: ワーカーが終了しました。");
+            }
+        }
+    }
+
+    fn pick_convert_save(&mut self) {
+        let ConvertState::PickSave {
+            markdown,
+            file_name,
+        } = std::mem::replace(&mut self.convert, ConvertState::Idle)
+        else {
+            return;
+        };
+
+        let Some(save_path) = rfd::FileDialog::new()
+            .set_title("Markdownを保存")
+            .add_filter("Markdown", &["md"])
+            .set_file_name(&file_name)
+            .save_file()
+        else {
+            self.log_line("保存をキャンセルしました。");
+            return;
+        };
+
+        self.log_line(format!("保存しています: {}", save_path.display()));
+        self.start_convert_write(markdown, save_path);
+    }
+
+    fn start_convert_write(&mut self, markdown: String, save_path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.convert = ConvertState::Writing(rx);
+
+        std::thread::Builder::new()
+            .name("write-markdown".into())
+            .spawn(move || {
+                let result = fs::write(&save_path, markdown)
+                    .map(|()| save_path)
+                    .map_err(|err| err.to_string());
+                let _ = tx.send(result);
+            })
+            .expect("failed to spawn write-markdown thread");
+    }
+
+    fn poll_convert_writing(&mut self, ctx: &egui::Context) {
+        let recv = match &self.convert {
+            ConvertState::Writing(rx) => rx.try_recv(),
+            _ => return,
+        };
+
+        match recv {
+            Ok(Ok(save_path)) => {
+                self.convert = ConvertState::Idle;
+                self.log_line(format!("保存しました: {}", save_path.display()));
+            }
+            Ok(Err(err)) => {
+                self.convert = ConvertState::Idle;
+                self.log_line(format!("保存に失敗しました: {err}"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.convert = ConvertState::Idle;
+                self.log_line("保存に失敗しました: ワーカーが終了しました。");
+            }
+        }
+    }
 }
 
 fn load_opensearch_or_log(
@@ -675,6 +844,7 @@ impl eframe::App for RToolsApp {
         } else {
             self.poll_export(ctx);
             self.poll_ingest(ctx);
+            self.poll_convert(ctx);
             self.poll_search(ctx);
         }
         self.sync_log();
@@ -707,6 +877,14 @@ impl eframe::App for RToolsApp {
                         .fill(egui::Color32::from_rgb(232, 240, 254));
                     if ui.add_enabled(idle, ingest_button).clicked() {
                         self.start_ingest();
+                    }
+
+                    let convert_button = egui::Button::new("PDFをMarkdownに変換")
+                        .min_size(egui::vec2(0.0, 40.0))
+                        .corner_radius(6.0)
+                        .fill(egui::Color32::from_rgb(232, 240, 254));
+                    if ui.add_enabled(idle, convert_button).clicked() {
+                        self.start_convert();
                     }
 
                     if let Some(hint) = busy_hint {
