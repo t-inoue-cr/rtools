@@ -78,7 +78,7 @@ pub fn structure_pdf(path: &Path) -> Result<Vec<PdfChunk>, String> {
     Ok(chunks_from_text(path, &text))
 }
 
-/// PDF からページ単位の Markdown を生成する。
+/// PDF から Markdown を生成する（ページ見出しは付けない）。
 pub fn pdf_to_markdown(path: &Path) -> Result<String, String> {
     let path_owned = path.to_path_buf();
     let caught = panic::catch_unwind(AssertUnwindSafe(|| markdown_from_pdf(&path_owned)));
@@ -101,13 +101,8 @@ fn markdown_from_pdf(path: &Path) -> Result<String, String> {
     let mut out = String::new();
     push_markdown_title(&mut out, path);
     let mut wrote_page = false;
-    for_each_page_blocks(path, |page, blocks| {
-        push_markdown_page(
-            &mut out,
-            &mut wrote_page,
-            page,
-            &blocks_to_markdown(&blocks),
-        );
+    for_each_page_blocks(path, |_, blocks| {
+        push_markdown_page(&mut out, &mut wrote_page, &blocks_to_markdown(&blocks));
         Ok(())
     })?;
     if !wrote_page {
@@ -121,13 +116,8 @@ fn markdown_from_text(path: &Path, text: &str) -> String {
     let mut out = String::with_capacity(text.len().saturating_add(64));
     push_markdown_title(&mut out, path);
     let mut wrote_page = false;
-    for (i, page) in text.split('\u{c}').enumerate() {
-        push_markdown_page(
-            &mut out,
-            &mut wrote_page,
-            (i + 1) as u32,
-            &collapse_ws(page),
-        );
+    for page in text.split('\u{c}') {
+        push_markdown_page(&mut out, &mut wrote_page, &collapse_ws(page));
     }
     out
 }
@@ -140,14 +130,13 @@ fn push_markdown_title(out: &mut String, path: &Path) {
     let _ = write!(out, "# {title}\n\n");
 }
 
-fn push_markdown_page(out: &mut String, wrote_page: &mut bool, page: u32, body: &str) {
+fn push_markdown_page(out: &mut String, wrote_page: &mut bool, body: &str) {
     if body.trim().is_empty() {
         return;
     }
     if *wrote_page {
         out.push('\n');
     }
-    let _ = write!(out, "## ページ {page}\n\n");
     out.push_str(body);
     if !body.ends_with('\n') {
         out.push('\n');
@@ -495,23 +484,22 @@ mod tests {
     #[test]
     fn markdown_uses_stem_as_title() {
         let md = markdown_from_text(Path::new("/docs/report.pdf"), "hello");
-        assert!(md.starts_with("# report\n\n"));
-        assert!(md.contains("## ページ 1\n\nhello\n"));
+        assert_eq!(md, "# report\n\nhello\n");
+        assert!(!md.contains("## ページ"));
     }
 
     #[test]
     fn markdown_splits_form_feed_as_pages() {
         let md = markdown_from_text(Path::new("a.pdf"), "page-one\u{c}page-two");
-        assert!(md.contains("## ページ 1\n\npage-one\n"));
-        assert!(md.contains("## ページ 2\n\npage-two\n"));
+        assert_eq!(md, "# a\n\npage-one\n\npage-two\n");
+        assert!(!md.contains("## ページ"));
     }
 
     #[test]
     fn markdown_skips_empty_pages() {
         let md = markdown_from_text(Path::new("a.pdf"), "keep\u{c}  \n\t\u{c}also");
-        assert!(md.contains("## ページ 1\n\nkeep\n"));
-        assert!(!md.contains("## ページ 2"));
-        assert!(md.contains("## ページ 3\n\nalso\n"));
+        assert_eq!(md, "# a\n\nkeep\n\nalso\n");
+        assert!(!md.contains("## ページ"));
     }
 
     #[test]
@@ -523,6 +511,7 @@ mod tests {
         let md = pdf_to_markdown(&pdf).expect("pdf_to_markdown");
         assert!(md.starts_with("# hello\n\n"), "unexpected markdown: {md:?}");
         assert!(md.contains("HelloPdfOxide"), "unexpected markdown: {md:?}");
+        assert!(!md.contains("## ページ"), "unexpected markdown: {md:?}");
         let _ = fs::remove_file(&pdf);
         let _ = fs::remove_dir(&dir);
     }
