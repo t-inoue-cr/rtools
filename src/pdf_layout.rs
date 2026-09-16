@@ -66,15 +66,38 @@ pub enum PageBlock {
     },
 }
 
+// Heading / overlap
 const HEADING_SIZE_RATIO: f32 = 1.25;
 const OVERLAP_DROP: f32 = 0.4;
-const INDENT_BREAK_EM: f32 = 2.0;
+
+// Line merge
 /// Docling `add_orphan_regions`: 同一行とみなす上端差（行高の比）。
 const SAME_LINE_TOP_RATIO: f32 = 0.9;
+const MIN_EM: f32 = 1.0;
+
+// Paragraph wrap
+const INDENT_BREAK_EM: f32 = 2.0;
 /// Docling `recover_text_panels`: 段落区切りは median leading のこの倍数。
 const LEADING_BREAK_RATIO: f32 = 1.8;
 /// 行送りが極端に小さいときの下限（median 行高の比）。
 const MIN_BREAK_HEIGHT_RATIO: f32 = 0.75;
+/// 折り返しとみなすため、前行の右端が枠右端から許される不足分（em）。
+const WRAP_FILL_EM: f32 = 0.5;
+const FRAME_RIGHT_PERCENTILE: f32 = 0.95;
+
+// Table grid
+const MIN_GRID_DIM: usize = 2;
+const MIN_POPULATED_CELLS: usize = 2;
+
+// Two-column gutter
+const MIN_LINES_FOR_GUTTER: usize = 8;
+const MIN_PAGE_WIDTH_FOR_GUTTER: f32 = 200.0;
+const GUTTER_BAND_RATIO: f32 = 0.08;
+const MAX_GUTTER_CROSSING_DENOM: usize = 10;
+const MIN_COLUMN_LINES: usize = 3;
+
+// Fallback
+const DEFAULT_MEDIAN_SIZE: f32 = 12.0;
 
 /// 行と表から段落・見出し・表ブロックを組み立てる。
 pub fn reconstruct_page(
@@ -98,7 +121,7 @@ pub fn reconstruct_page(
     let gutter = detect_gutter(&lines);
     let items = ordered_items(lines, tables, gutter);
     let leading = median_line_gap(&items);
-    merge_items(items, median_size, leading)
+    merge_items(items, median_size, leading, gutter)
 }
 
 pub fn blocks_to_markdown(blocks: &[PageBlock]) -> String {
@@ -292,7 +315,7 @@ fn merge_same_lines(mut lines: Vec<LayoutLine>) -> Vec<LayoutLine> {
         if let Some(row) = rows.last_mut()
             && let Some(last) = row.last()
         {
-            let h = last.height.max(line.height).max(1.0);
+            let h = last.height.max(line.height).max(MIN_EM);
             if (last.visual_top() - line.visual_top()).abs() < h * SAME_LINE_TOP_RATIO {
                 row.push(line);
                 continue;
@@ -307,7 +330,7 @@ fn merge_same_lines(mut lines: Vec<LayoutLine>) -> Vec<LayoutLine> {
         let mut row_merged: Vec<LayoutLine> = Vec::with_capacity(row.len());
         for line in row {
             if row_merged.last().is_some_and(|last| {
-                let h = last.height.max(line.height).max(1.0);
+                let h = last.height.max(line.height).max(MIN_EM);
                 line.x <= last.right() + h
             }) {
                 let prev = row_merged.pop().expect("last fragment");
@@ -322,7 +345,7 @@ fn merge_same_lines(mut lines: Vec<LayoutLine>) -> Vec<LayoutLine> {
 }
 
 fn is_same_line(prev: &LayoutLine, next: &LayoutLine) -> bool {
-    let h = prev.height.max(next.height).max(1.0);
+    let h = prev.height.max(next.height).max(MIN_EM);
     let same_line = (prev.visual_top() - next.visual_top()).abs() < h * SAME_LINE_TOP_RATIO;
     let touching = next.x <= prev.right() + h && next.x >= prev.x - h;
     same_line && touching
@@ -347,11 +370,17 @@ fn median_line_gap(items: &[Item]) -> f32 {
 }
 
 fn paragraph_break_threshold(leading: f32, median_size: f32) -> f32 {
-    let height = median_size.max(1.0);
+    let height = median_size.max(MIN_EM);
     (LEADING_BREAK_RATIO * leading.max(0.0)).max(MIN_BREAK_HEIGHT_RATIO * height)
 }
 
-fn merge_items(items: Vec<Item>, median_size: f32, leading: f32) -> Vec<PageBlock> {
+fn merge_items(
+    items: Vec<Item>,
+    median_size: f32,
+    leading: f32,
+    gutter: Option<f32>,
+) -> Vec<PageBlock> {
+    let extents = line_extents(&items);
     let mut blocks = Vec::new();
     let mut paragraph: Option<LayoutLine> = None;
 
@@ -374,8 +403,17 @@ fn merge_items(items: Vec<Item>, median_size: f32, leading: f32) -> Vec<PageBloc
                     continue;
                 }
                 match paragraph.take() {
-                    Some(prev) if should_continue(&prev, &line, median_size, leading) => {
-                        paragraph = Some(join_lines(prev, &line));
+                    Some(prev)
+                        if should_continue(
+                            &prev,
+                            &line,
+                            median_size,
+                            leading,
+                            column_frame_right(&prev, &extents, gutter, median_size)
+                                .max(line.right()),
+                        ) =>
+                    {
+                        paragraph = Some(join_wrapped_lines(prev, &line));
                     }
                     Some(prev) => {
                         push_paragraph(prev, &mut blocks);
@@ -415,7 +453,24 @@ fn join_lines(mut prev: LayoutLine, next: &LayoutLine) -> LayoutLine {
     prev
 }
 
-fn should_continue(prev: &LayoutLine, next: &LayoutLine, median_size: f32, leading: f32) -> bool {
+/// 折り返し結合。続き判定のため、最後の物理行の座標を残す。
+fn join_wrapped_lines(mut prev: LayoutLine, next: &LayoutLine) -> LayoutLine {
+    append_fragment(&mut prev.text, &next.text);
+    prev.x = next.x;
+    prev.y = next.y;
+    prev.width = next.width;
+    prev.height = next.height;
+    prev.font_size = next.font_size;
+    prev
+}
+
+fn should_continue(
+    prev: &LayoutLine,
+    next: &LayoutLine,
+    median_size: f32,
+    leading: f32,
+    frame_right: f32,
+) -> bool {
     if is_heading(next, median_size) {
         return false;
     }
@@ -429,11 +484,76 @@ fn should_continue(prev: &LayoutLine, next: &LayoutLine, median_size: f32, leadi
     if next.right() < prev.x {
         return false;
     }
-    if next.x - prev.x > INDENT_BREAK_EM * median_size.max(1.0) {
+    let em = median_size.max(MIN_EM);
+    if next.x - prev.x > INDENT_BREAK_EM * em {
         return false;
     }
     let gap = (prev.y - next.visual_top()).max(0.0);
-    gap <= paragraph_break_threshold(leading, median_size)
+    if gap > paragraph_break_threshold(leading, median_size) {
+        return false;
+    }
+    frame_right - prev.right() <= WRAP_FILL_EM * em
+}
+
+#[derive(Clone, Copy)]
+struct LineExtent {
+    x: f32,
+    right: f32,
+    center_x: f32,
+}
+
+fn line_extents(items: &[Item]) -> Vec<LineExtent> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Line(line) => Some(LineExtent {
+                x: line.x,
+                right: line.right(),
+                center_x: line.center_x(),
+            }),
+            Item::Table(_) => None,
+        })
+        .collect()
+}
+
+/// 同じ枠の右端。行番号が乗った外れ値で max が膨らむのを避けるため 95 パーセンタイルにする。
+fn column_frame_right(
+    line: &LayoutLine,
+    extents: &[LineExtent],
+    gutter: Option<f32>,
+    median_size: f32,
+) -> f32 {
+    let slack_x = INDENT_BREAK_EM * median_size.max(MIN_EM);
+    let mut rights: Vec<f32> = Vec::new();
+    for other in extents {
+        if !in_same_frame(line, other, gutter, slack_x) {
+            continue;
+        }
+        rights.push(other.right);
+    }
+    percentile_f32(rights, FRAME_RIGHT_PERCENTILE).max(line.right())
+}
+
+fn percentile_f32(mut values: Vec<f32>, p: f32) -> f32 {
+    values.retain(|v| v.is_finite());
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let idx = ((values.len() - 1) as f32 * p.clamp(0.0, 1.0)).round() as usize;
+    values[idx.min(values.len() - 1)]
+}
+
+fn in_same_frame(line: &LayoutLine, other: &LineExtent, gutter: Option<f32>, slack_x: f32) -> bool {
+    if let Some(gutter) = gutter {
+        let line_span = line.x < gutter && line.right() > gutter;
+        let other_span = other.x < gutter && other.right > gutter;
+        if line_span || other_span {
+            return line_span && other_span;
+        }
+        return (line.center_x() < gutter) == (other.center_x < gutter);
+    }
+    (other.x - line.x).abs() <= slack_x
 }
 
 fn is_heading(line: &LayoutLine, median_size: f32) -> bool {
@@ -445,22 +565,24 @@ fn is_heading(line: &LayoutLine, median_size: f32) -> bool {
 }
 
 fn is_real_grid(rows: &[Vec<String>]) -> bool {
-    if rows.len() < 2 {
+    if rows.len() < MIN_GRID_DIM {
         return false;
     }
     let cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
-    if cols < 2 {
+    if cols < MIN_GRID_DIM {
         return false;
     }
     let populated = rows
         .iter()
-        .filter(|row| row.iter().filter(|cell| !cell.trim().is_empty()).count() >= 2)
+        .filter(|row| {
+            row.iter().filter(|cell| !cell.trim().is_empty()).count() >= MIN_POPULATED_CELLS
+        })
         .count();
     populated * 2 >= rows.len()
 }
 
 fn detect_gutter(lines: &[LayoutLine]) -> Option<f32> {
-    if lines.len() < 8 {
+    if lines.len() < MIN_LINES_FOR_GUTTER {
         return None;
     }
     let mut page_left = f32::INFINITY;
@@ -470,12 +592,12 @@ fn detect_gutter(lines: &[LayoutLine]) -> Option<f32> {
         page_right = page_right.max(line.right());
     }
     let width = page_right - page_left;
-    if !width.is_finite() || width < 200.0 {
+    if !width.is_finite() || width < MIN_PAGE_WIDTH_FOR_GUTTER {
         return None;
     }
     let mid = (page_left + page_right) / 2.0;
-    let gutter_lo = mid - width * 0.08;
-    let gutter_hi = mid + width * 0.08;
+    let gutter_lo = mid - width * GUTTER_BAND_RATIO;
+    let gutter_hi = mid + width * GUTTER_BAND_RATIO;
     let mut crossing = 0usize;
     let mut left = 0usize;
     let mut right = 0usize;
@@ -490,7 +612,10 @@ fn detect_gutter(lines: &[LayoutLine]) -> Option<f32> {
             right += 1;
         }
     }
-    if crossing <= lines.len() / 10 && left >= 3 && right >= 3 {
+    if crossing <= lines.len() / MAX_GUTTER_CROSSING_DENOM
+        && left >= MIN_COLUMN_LINES
+        && right >= MIN_COLUMN_LINES
+    {
         Some(mid)
     } else {
         None
@@ -613,7 +738,7 @@ where
 {
     let mut values: Vec<f32> = values.filter(|v| v.is_finite() && *v > 0.0).collect();
     if values.is_empty() {
-        return 12.0;
+        return DEFAULT_MEDIAN_SIZE;
     }
     values.sort_by(|a, b| a.total_cmp(b));
     let mid = values.len() / 2;
@@ -712,6 +837,39 @@ mod tests {
         assert_eq!(
             blocks,
             vec![PageBlock::Paragraph("これは一文です。次の文です。".into())]
+        );
+    }
+
+    #[test]
+    fn splits_when_previous_line_does_not_fill_frame() {
+        let lines = [
+            line("短い段落。", 50.0, 700.0, 80.0, 14.0, 12.0),
+            line("次の段落は長い行です。", 50.0, 684.0, 200.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![
+                PageBlock::Paragraph("短い段落。".into()),
+                PageBlock::Paragraph("次の段落は長い行です。".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_after_short_wrap_before_next_paragraph() {
+        let lines = [
+            line("これは折り返された長い", 50.0, 700.0, 200.0, 14.0, 12.0),
+            line("段落の終わり。", 50.0, 684.0, 90.0, 14.0, 12.0),
+            line("新しい段落の始まりは長い行", 50.0, 668.0, 200.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![
+                PageBlock::Paragraph("これは折り返された長い段落の終わり。".into()),
+                PageBlock::Paragraph("新しい段落の始まりは長い行".into()),
+            ]
         );
     }
 
