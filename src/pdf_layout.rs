@@ -58,7 +58,14 @@ impl LayoutTable {
 /// ページを再構成したブロック。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageBlock {
-    Heading(String),
+    Heading {
+        text: String,
+        level: u8,
+    },
+    Toc {
+        title: Option<String>,
+        entries: Vec<String>,
+    },
     Paragraph(String),
     Table {
         rows: Vec<Vec<String>>,
@@ -67,7 +74,12 @@ pub enum PageBlock {
 }
 
 // Heading / overlap
-const HEADING_SIZE_RATIO: f32 = 1.25;
+/// 本文最頻サイズに対する見出し比。`#` はファイル名用なので本文は `##` から。
+const HEADING_RATIO_H2: f32 = 1.75;
+const HEADING_RATIO_H3: f32 = 1.35;
+const HEADING_RATIO_H4: f32 = 1.15;
+const HEADING_MAX_CHARS: usize = 80;
+const TOC_ENTRY_MAX_CHARS: usize = 120;
 const OVERLAP_DROP: f32 = 0.4;
 
 // Line merge
@@ -118,10 +130,11 @@ pub fn reconstruct_page(
 
     let lines = merge_same_lines(lines);
     let median_size = median_f32(lines.iter().map(|line| line.height.max(line.font_size)));
+    let body_size = modal_font_size(lines.iter().map(|line| line.font_size));
     let gutter = detect_gutter(&lines);
     let items = ordered_items(lines, tables, gutter);
     let leading = median_line_gap(&items);
-    merge_items(items, median_size, leading, gutter)
+    merge_items(items, median_size, body_size, leading, gutter)
 }
 
 pub fn blocks_to_markdown(blocks: &[PageBlock]) -> String {
@@ -131,9 +144,16 @@ pub fn blocks_to_markdown(blocks: &[PageBlock]) -> String {
             out.push_str("\n\n");
         }
         match block {
-            PageBlock::Heading(text) => {
-                out.push_str("### ");
+            PageBlock::Heading { text, level } => {
+                let level = heading_level(*level);
+                for _ in 0..level {
+                    out.push('#');
+                }
+                out.push(' ');
                 out.push_str(text);
+            }
+            PageBlock::Toc { title, entries } => {
+                push_toc_markdown(&mut out, title.as_deref(), entries);
             }
             PageBlock::Paragraph(text) => out.push_str(text),
             PageBlock::Table { rows, has_header } => {
@@ -151,7 +171,21 @@ pub fn blocks_to_plain(blocks: &[PageBlock]) -> String {
             out.push_str("\n\n");
         }
         match block {
-            PageBlock::Heading(text) | PageBlock::Paragraph(text) => out.push_str(text),
+            PageBlock::Heading { text, .. } | PageBlock::Paragraph(text) => out.push_str(text),
+            PageBlock::Toc { title, entries } => {
+                if let Some(title) = title {
+                    out.push_str(title);
+                    if !entries.is_empty() {
+                        out.push('\n');
+                    }
+                }
+                for (i, entry) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str(entry);
+                }
+            }
             PageBlock::Table { rows, .. } => {
                 for (i, row) in rows.iter().enumerate() {
                     if i > 0 {
@@ -166,6 +200,44 @@ pub fn blocks_to_plain(blocks: &[PageBlock]) -> String {
                 }
             }
         }
+    }
+    out
+}
+
+/// 視覚的な目次ブロックがあるか。
+pub fn page_blocks_have_toc(blocks: &[PageBlock]) -> bool {
+    blocks.iter().any(|block| {
+        matches!(
+            block,
+            PageBlock::Toc { entries, .. } if !entries.is_empty()
+        )
+    })
+}
+
+/// しおり階層を見出しレベルに反映する。一致した段落は見出しにする。
+pub fn apply_outline_levels(pages: &mut [Vec<PageBlock>], outline: &[(String, u8)]) {
+    if outline.is_empty() {
+        return;
+    }
+    for blocks in pages {
+        apply_outline_levels_page(blocks, outline);
+    }
+}
+
+/// しおりから Markdown 目次を作る（視覚的目次が無いとき用）。
+pub fn bookmark_toc_markdown(outline: &[(String, u8)]) -> String {
+    if outline.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## 目次\n");
+    for (title, level) in outline {
+        out.push('\n');
+        let depth = heading_level(*level).saturating_sub(2) as usize;
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+        out.push_str("- ");
+        out.push_str(title.trim());
     }
     out
 }
@@ -377,16 +449,21 @@ fn paragraph_break_threshold(leading: f32, median_size: f32) -> f32 {
 fn merge_items(
     items: Vec<Item>,
     median_size: f32,
+    body_size: f32,
     leading: f32,
     gutter: Option<f32>,
 ) -> Vec<PageBlock> {
     let extents = line_extents(&items);
     let mut blocks = Vec::new();
     let mut paragraph: Option<LayoutLine> = None;
+    let mut toc: Option<(Option<String>, Vec<String>)> = None;
+    let mut in_toc = false;
 
     for item in items {
         match item {
             Item::Table(table) => {
+                in_toc = false;
+                flush_toc(&mut toc, &mut blocks);
                 flush_paragraph(&mut paragraph, &mut blocks);
                 blocks.push(PageBlock::Table {
                     rows: table.rows,
@@ -394,12 +471,31 @@ fn merge_items(
                 });
             }
             Item::Line(line) => {
-                if is_heading(&line, median_size) {
+                let text = collapse_inline_ws(&line.text);
+                if text.is_empty() {
+                    continue;
+                }
+                if is_toc_title(&text) {
                     flush_paragraph(&mut paragraph, &mut blocks);
-                    let text = collapse_inline_ws(&line.text);
-                    if !text.is_empty() {
-                        blocks.push(PageBlock::Heading(text));
+                    flush_toc(&mut toc, &mut blocks);
+                    toc = Some((Some(text), Vec::new()));
+                    in_toc = true;
+                    continue;
+                }
+                if is_toc_entry(&text, in_toc) {
+                    flush_paragraph(&mut paragraph, &mut blocks);
+                    match &mut toc {
+                        Some((_, entries)) => entries.push(text),
+                        None => toc = Some((None, vec![text])),
                     }
+                    in_toc = true;
+                    continue;
+                }
+                in_toc = false;
+                flush_toc(&mut toc, &mut blocks);
+                if let Some(level) = heading_level_for_line(&line, &text, body_size) {
+                    flush_paragraph(&mut paragraph, &mut blocks);
+                    blocks.push(PageBlock::Heading { text, level });
                     continue;
                 }
                 match paragraph.take() {
@@ -408,6 +504,7 @@ fn merge_items(
                             &prev,
                             &line,
                             median_size,
+                            body_size,
                             leading,
                             column_frame_right(&prev, &extents, gutter, median_size)
                                 .max(line.right()),
@@ -425,6 +522,7 @@ fn merge_items(
         }
     }
     flush_paragraph(&mut paragraph, &mut blocks);
+    flush_toc(&mut toc, &mut blocks);
     blocks
 }
 
@@ -468,10 +566,15 @@ fn should_continue(
     prev: &LayoutLine,
     next: &LayoutLine,
     median_size: f32,
+    body_size: f32,
     leading: f32,
     frame_right: f32,
 ) -> bool {
-    if is_heading(next, median_size) {
+    let next_text = collapse_inline_ws(&next.text);
+    if is_toc_title(&next_text) || is_toc_entry(&next_text, false) {
+        return false;
+    }
+    if heading_level_for_line(next, &next_text, body_size).is_some() {
         return false;
     }
     if is_same_line(prev, next) {
@@ -556,12 +659,296 @@ fn in_same_frame(line: &LayoutLine, other: &LineExtent, gutter: Option<f32>, sla
     (other.x - line.x).abs() <= slack_x
 }
 
-fn is_heading(line: &LayoutLine, median_size: f32) -> bool {
-    if line.heading_level.is_some() {
+fn heading_level_for_line(line: &LayoutLine, text: &str, body_size: f32) -> Option<u8> {
+    if let Some(level) = line.heading_level {
+        return Some(heading_level(level));
+    }
+    if let Some(level) = patent_heading_level(text) {
+        return Some(level);
+    }
+    if let Some(level) = numbered_heading_level(text) {
+        return Some(level);
+    }
+    if !looks_like_heading_text(text) {
+        return None;
+    }
+    let size = if line.font_size > 1.0 {
+        line.font_size
+    } else {
+        line.height
+    };
+    let ratio = size / body_size.max(1.0);
+    if ratio >= HEADING_RATIO_H2 {
+        Some(2)
+    } else if ratio >= HEADING_RATIO_H3 {
+        Some(3)
+    } else if ratio >= HEADING_RATIO_H4 {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn heading_level(level: u8) -> u8 {
+    level.clamp(1, 6)
+}
+
+fn looks_like_heading_text(text: &str) -> bool {
+    let n = text.chars().count();
+    if n < 2 || n > HEADING_MAX_CHARS {
+        return false;
+    }
+    if text.contains('@') {
+        return false;
+    }
+    if text.ends_with('。') || text.ends_with('.') {
+        return false;
+    }
+    text.chars().any(|ch| ch.is_alphabetic() || is_cjk(ch))
+}
+
+fn numbered_heading_level(text: &str) -> Option<u8> {
+    let mut chars = text.chars().peekable();
+    if !chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts = 0u8;
+    loop {
+        if !chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        while chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+            chars.next();
+        }
+        parts = parts.saturating_add(1);
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            if chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+        }
+        break;
+    }
+    let rest: String = chars.collect();
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.ends_with('。') || rest.ends_with('.') {
+        return None;
+    }
+    if rest.chars().count() > HEADING_MAX_CHARS {
+        return None;
+    }
+    if !rest.chars().any(|ch| ch.is_alphabetic() || is_cjk(ch)) {
+        return None;
+    }
+    Some((parts + 1).clamp(2, 6))
+}
+
+fn patent_heading_level(text: &str) -> Option<u8> {
+    let mut chars = text.chars();
+    if chars.next() != Some('【') || !text.ends_with('】') {
+        return None;
+    }
+    let inner_len = text.chars().count().saturating_sub(2);
+    if inner_len == 0 || inner_len > 20 {
+        return None;
+    }
+    let inner: String = text.chars().skip(1).take(inner_len).collect();
+    if is_patent_paragraph_id(&inner) {
+        return None;
+    }
+    if inner.starts_with("請求項") {
+        Some(3)
+    } else {
+        Some(2)
+    }
+}
+
+fn is_patent_paragraph_id(inner: &str) -> bool {
+    !inner.is_empty() && inner.chars().all(is_decimal_digit)
+}
+
+fn is_decimal_digit(ch: char) -> bool {
+    ch.is_ascii_digit() || ('０'..='９').contains(&ch)
+}
+
+fn is_toc_title(text: &str) -> bool {
+    let trimmed = text.trim().trim_end_matches(':').trim();
+    let lower: String = trimmed.chars().flat_map(char::to_lowercase).collect();
+    matches!(
+        lower.as_str(),
+        "目次" | "contents" | "table of contents" | "目 次"
+    )
+}
+
+fn is_toc_entry(text: &str, in_toc: bool) -> bool {
+    let n = text.chars().count();
+    if n < 3 || n > TOC_ENTRY_MAX_CHARS {
+        return false;
+    }
+    if !ends_with_page_number(text) {
+        return false;
+    }
+    if has_dot_leader(text) {
         return true;
     }
-    let size = line.font_size.max(line.height);
-    median_size > 0.0 && size >= HEADING_SIZE_RATIO * median_size
+    in_toc
+}
+
+fn has_dot_leader(text: &str) -> bool {
+    if text.contains("...") || text.contains('…') || text.contains("···") {
+        return true;
+    }
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if is_leader_char(ch) {
+            run += 1;
+            if run >= 3 {
+                return true;
+            }
+        } else if ch.is_whitespace() {
+            continue;
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn is_leader_char(ch: char) -> bool {
+    matches!(ch, '.' | '．' | '·' | '・' | '…' | '⋯')
+}
+
+fn ends_with_page_number(text: &str) -> bool {
+    let chars: Vec<char> = text.trim_end().chars().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    let mut i = chars.len();
+    let mut digits = 0usize;
+    while i > 0 && is_decimal_digit(chars[i - 1]) {
+        i -= 1;
+        digits += 1;
+    }
+    if digits == 0 || digits > 4 || i == 0 {
+        return false;
+    }
+    chars[i - 1].is_whitespace() || is_leader_char(chars[i - 1])
+}
+
+fn flush_toc(toc: &mut Option<(Option<String>, Vec<String>)>, blocks: &mut Vec<PageBlock>) {
+    let Some((title, entries)) = toc.take() else {
+        return;
+    };
+    if title.is_none() && entries.is_empty() {
+        return;
+    }
+    blocks.push(PageBlock::Toc { title, entries });
+}
+
+fn push_toc_markdown(out: &mut String, title: Option<&str>, entries: &[String]) {
+    if let Some(title) = title {
+        out.push_str("## ");
+        out.push_str(title);
+        if !entries.is_empty() {
+            out.push('\n');
+        }
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(entry);
+    }
+}
+
+fn apply_outline_levels_page(blocks: &mut Vec<PageBlock>, outline: &[(String, u8)]) {
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks.drain(..) {
+        match block {
+            PageBlock::Heading { text, mut level } => {
+                if let Some(outline_level) = match_outline_level(&text, outline) {
+                    level = outline_level;
+                }
+                out.push(PageBlock::Heading { text, level });
+            }
+            PageBlock::Paragraph(text) => {
+                if let Some(level) = match_outline_level(&text, outline) {
+                    out.push(PageBlock::Heading { text, level });
+                } else {
+                    out.push(PageBlock::Paragraph(text));
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    *blocks = out;
+}
+
+fn match_outline_level(text: &str, outline: &[(String, u8)]) -> Option<u8> {
+    let key = normalize_heading_key(text);
+    if key.is_empty() {
+        return None;
+    }
+    let text_chars = key.chars().count();
+    for (title, level) in outline {
+        let title_key = normalize_heading_key(title);
+        if title_key.is_empty() {
+            continue;
+        }
+        if key == title_key {
+            return Some(heading_level(*level));
+        }
+        let title_chars = title_key.chars().count();
+        if key.starts_with(&title_key) && text_chars <= title_chars + 8 {
+            return Some(heading_level(*level));
+        }
+    }
+    None
+}
+
+fn normalize_heading_key(text: &str) -> String {
+    let collapsed = collapse_inline_ws(text);
+    let stripped = strip_trailing_page_number(&collapsed);
+    stripped
+        .chars()
+        .filter(|ch| !is_leader_char(*ch) && !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn strip_trailing_page_number(text: &str) -> String {
+    if !ends_with_page_number(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.trim_end().chars().collect();
+    let mut i = chars.len();
+    while i > 0 && is_decimal_digit(chars[i - 1]) {
+        i -= 1;
+    }
+    chars[..i].iter().collect::<String>().trim_end().to_string()
+}
+
+fn modal_font_size<I>(values: I) -> f32
+where
+    I: Iterator<Item = f32>,
+{
+    let mut buckets: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for value in values {
+        if value.is_finite() && value > 0.0 {
+            let key = (value * 10.0).round() as i32;
+            *buckets.entry(key).or_default() += 1;
+        }
+    }
+    let Some((&key, _)) = buckets
+        .iter()
+        .max_by(|(a_key, a_c), (b_key, b_c)| a_c.cmp(b_c).then_with(|| b_key.cmp(a_key)))
+    else {
+        return DEFAULT_MEDIAN_SIZE;
+    };
+    key as f32 / 10.0
 }
 
 fn is_real_grid(rows: &[Vec<String>]) -> bool {
@@ -977,18 +1364,197 @@ mod tests {
         let lines = [
             line("大きな見出し", 50.0, 720.0, 180.0, 22.0, 22.0),
             line("本文の一行目です。", 50.0, 690.0, 180.0, 14.0, 12.0),
+            line("本文の二行目です。", 50.0, 674.0, 180.0, 14.0, 12.0),
         ];
         let blocks = reconstruct_page(lines.into(), Vec::new());
         assert_eq!(
             blocks,
             vec![
-                PageBlock::Heading("大きな見出し".into()),
-                PageBlock::Paragraph("本文の一行目です。".into()),
+                PageBlock::Heading {
+                    text: "大きな見出し".into(),
+                    level: 2,
+                },
+                PageBlock::Paragraph("本文の一行目です。本文の二行目です。".into()),
             ]
         );
         assert_eq!(
             blocks_to_markdown(&blocks),
-            "### 大きな見出し\n\n本文の一行目です。"
+            "## 大きな見出し\n\n本文の一行目です。本文の二行目です。"
+        );
+    }
+
+    #[test]
+    fn numbered_headings_use_outline_levels() {
+        let lines = [
+            line("1 Introduction", 50.0, 720.0, 160.0, 14.0, 12.0),
+            line(
+                "Body of the first section goes here.",
+                50.0,
+                700.0,
+                280.0,
+                14.0,
+                12.0,
+            ),
+            line("1.1 Background", 50.0, 670.0, 150.0, 14.0, 12.0),
+            line(
+                "Body of the nested section goes here.",
+                50.0,
+                650.0,
+                280.0,
+                14.0,
+                12.0,
+            ),
+            line("1.1.1 Details", 50.0, 620.0, 140.0, 14.0, 12.0),
+            line(
+                "Body of the third level goes here.",
+                50.0,
+                600.0,
+                280.0,
+                14.0,
+                12.0,
+            ),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![
+                PageBlock::Heading {
+                    text: "1 Introduction".into(),
+                    level: 2,
+                },
+                PageBlock::Paragraph("Body of the first section goes here.".into()),
+                PageBlock::Heading {
+                    text: "1.1 Background".into(),
+                    level: 3,
+                },
+                PageBlock::Paragraph("Body of the nested section goes here.".into()),
+                PageBlock::Heading {
+                    text: "1.1.1 Details".into(),
+                    level: 4,
+                },
+                PageBlock::Paragraph("Body of the third level goes here.".into()),
+            ]
+        );
+        let md = blocks_to_markdown(&blocks);
+        assert!(md.starts_with("## 1 Introduction\n\n"));
+        assert!(md.contains("\n### 1.1 Background\n\n"));
+        assert!(md.contains("\n#### 1.1.1 Details\n\n"));
+    }
+
+    #[test]
+    fn patent_section_labels_become_headings() {
+        let lines = [
+            line("【技術分野】", 50.0, 720.0, 90.0, 14.0, 12.0),
+            line(
+                "本発明はインジェクタに関する。",
+                50.0,
+                700.0,
+                220.0,
+                14.0,
+                12.0,
+            ),
+            line("【請求項１】", 50.0, 670.0, 90.0, 14.0, 12.0),
+            line("インジェクタであって、", 50.0, 650.0, 180.0, 14.0, 12.0),
+            line("【０００１】", 50.0, 620.0, 80.0, 14.0, 12.0),
+            line("説明の段落です。", 50.0, 600.0, 140.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![
+                PageBlock::Heading {
+                    text: "【技術分野】".into(),
+                    level: 2,
+                },
+                PageBlock::Paragraph("本発明はインジェクタに関する。".into()),
+                PageBlock::Heading {
+                    text: "【請求項１】".into(),
+                    level: 3,
+                },
+                PageBlock::Paragraph("インジェクタであって、".into()),
+                PageBlock::Paragraph("【０００１】".into()),
+                PageBlock::Paragraph("説明の段落です。".into()),
+            ]
+        );
+        let md = blocks_to_markdown(&blocks);
+        assert!(md.contains("## 【技術分野】"));
+        assert!(md.contains("### 【請求項１】"));
+        assert!(!md.contains("# 【０００１】"));
+    }
+
+    #[test]
+    fn long_large_font_line_is_not_a_heading() {
+        let long = "Accurate document layout analysis is a key requirement for high quality PDF document conversion across many domains.";
+        assert!(long.chars().count() > 80);
+        let lines = [
+            line(long, 50.0, 720.0, 120.0, 22.0, 22.0),
+            line("本文です。", 50.0, 690.0, 180.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![
+                PageBlock::Paragraph(long.into()),
+                PageBlock::Paragraph("本文です。".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn toc_entries_stay_on_separate_lines() {
+        let lines = [
+            line("目次", 50.0, 740.0, 40.0, 16.0, 16.0),
+            line("1 Introduction ........ 1", 50.0, 710.0, 400.0, 14.0, 12.0),
+            line("1.1 Background ........ 2", 50.0, 694.0, 400.0, 14.0, 12.0),
+            line("2 Related Work ........ 5", 50.0, 678.0, 400.0, 14.0, 12.0),
+            line("本文の始まりです。", 50.0, 640.0, 180.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![
+                PageBlock::Toc {
+                    title: Some("目次".into()),
+                    entries: vec![
+                        "1 Introduction ........ 1".into(),
+                        "1.1 Background ........ 2".into(),
+                        "2 Related Work ........ 5".into(),
+                    ],
+                },
+                PageBlock::Paragraph("本文の始まりです。".into()),
+            ]
+        );
+        assert_eq!(
+            blocks_to_markdown(&blocks),
+            "## 目次\n1 Introduction ........ 1\n1.1 Background ........ 2\n2 Related Work ........ 5\n\n本文の始まりです。"
+        );
+    }
+
+    #[test]
+    fn outline_levels_override_matching_headings() {
+        let mut pages = vec![vec![
+            PageBlock::Heading {
+                text: "Introduction".into(),
+                level: 3,
+            },
+            PageBlock::Paragraph("Background".into()),
+        ]];
+        apply_outline_levels(
+            &mut pages,
+            &[("Introduction".into(), 2), ("Background".into(), 3)],
+        );
+        assert_eq!(
+            pages[0],
+            vec![
+                PageBlock::Heading {
+                    text: "Introduction".into(),
+                    level: 2,
+                },
+                PageBlock::Heading {
+                    text: "Background".into(),
+                    level: 3,
+                },
+            ]
         );
     }
 

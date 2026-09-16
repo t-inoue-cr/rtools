@@ -66,6 +66,28 @@ fn converts_sample_pdfs_to_markdown() {
                 pdf.display()
             );
         }
+        if stem.contains("2026") {
+            assert!(
+                markdown.contains("## 【技術分野】"),
+                "{}: missing section heading\n{markdown}",
+                pdf.display()
+            );
+            assert!(
+                markdown.contains("### 【請求項１】") || markdown.contains("### 【請求項1】"),
+                "{}: missing claim heading\n{markdown}",
+                pdf.display()
+            );
+            assert!(
+                !markdown.contains("# 【０００１】") && !markdown.contains("# 【0001】"),
+                "{}: paragraph number became a heading\n{markdown}",
+                pdf.display()
+            );
+            assert!(
+                !markdown.contains("bibliographic-data"),
+                "{}: internal bookmark leaked into markdown\n{markdown}",
+                pdf.display()
+            );
+        }
 
         let md_path = pdf.with_file_name(markdown_file_name(&pdf));
         fs::write(&md_path, markdown.as_bytes())

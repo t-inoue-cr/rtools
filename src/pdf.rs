@@ -8,8 +8,8 @@ use pdf_oxide::layout::TextLine;
 use pdf_oxide::structure::Table;
 
 use crate::pdf_layout::{
-    LayoutLine, LayoutTable, PageBlock, blocks_to_markdown, blocks_to_plain, join_fragments,
-    reconstruct_page,
+    LayoutLine, LayoutTable, PageBlock, apply_outline_levels, blocks_to_markdown, blocks_to_plain,
+    bookmark_toc_markdown, join_fragments, page_blocks_have_toc, reconstruct_page,
 };
 
 /// OpenSearch に登録する 1 チャンク（ページ内のテキスト断片）。
@@ -98,17 +98,74 @@ pub fn markdown_file_name(path: &Path) -> String {
 }
 
 fn markdown_from_pdf(path: &Path) -> Result<String, String> {
+    let outline = load_outline(path);
+    let mut pages = Vec::new();
+    for_each_page_blocks(path, |_, blocks| {
+        pages.push(blocks);
+        Ok(())
+    })?;
+    if pages.is_empty() {
+        return Err("テキストが空でした".into());
+    }
+    let has_visual_toc = pages.iter().any(|page| page_blocks_have_toc(page));
+    apply_outline_levels(&mut pages, &outline);
+
     let mut out = String::new();
     push_markdown_title(&mut out, path);
     let mut wrote_page = false;
-    for_each_page_blocks(path, |_, blocks| {
-        push_markdown_page(&mut out, &mut wrote_page, &blocks_to_markdown(&blocks));
-        Ok(())
-    })?;
-    if !wrote_page {
-        return Err("テキストが空でした".into());
+    if !has_visual_toc && !outline.is_empty() {
+        push_markdown_page(&mut out, &mut wrote_page, &bookmark_toc_markdown(&outline));
+    }
+    for blocks in &pages {
+        push_markdown_page(&mut out, &mut wrote_page, &blocks_to_markdown(blocks));
     }
     Ok(out)
+}
+
+fn load_outline(path: &Path) -> Vec<(String, u8)> {
+    let Ok(doc) = pdf_oxide::PdfDocument::open(path) else {
+        return Vec::new();
+    };
+    let Ok(Some(items)) = doc.get_outline() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    flatten_outline(&items, 0, &mut out);
+    out
+}
+
+fn flatten_outline(items: &[pdf_oxide::OutlineItem], depth: u8, out: &mut Vec<(String, u8)>) {
+    for item in items {
+        let title = item.title.trim();
+        if is_usable_outline_title(title) {
+            out.push((title.to_string(), depth.saturating_add(2).min(6)));
+        }
+        if depth < 5 {
+            flatten_outline(&item.children, depth.saturating_add(1), out);
+        }
+    }
+}
+
+fn is_usable_outline_title(title: &str) -> bool {
+    if title.is_empty() || title == "(No Title)" {
+        return false;
+    }
+    if title.chars().any(is_outline_visible_char) {
+        return true;
+    }
+    title.contains(' ')
+}
+
+fn is_outline_visible_char(ch: char) -> bool {
+    ch.is_ascii_uppercase()
+        || matches!(
+            ch,
+            '\u{3000}'..='\u{303F}'
+                | '\u{3040}'..='\u{30FF}'
+                | '\u{3400}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{FF00}'..='\u{FFEF}'
+        )
 }
 
 #[cfg(test)]
@@ -500,6 +557,17 @@ mod tests {
         let md = markdown_from_text(Path::new("a.pdf"), "keep\u{c}  \n\t\u{c}also");
         assert_eq!(md, "# a\n\nkeep\n\nalso\n");
         assert!(!md.contains("## ページ"));
+    }
+
+    #[test]
+    fn outline_skips_internal_structure_tags() {
+        assert!(!is_usable_outline_title("bibliographic-data"));
+        assert!(!is_usable_outline_title("abstract"));
+        assert!(!is_usable_outline_title("overflow"));
+        assert!(is_usable_outline_title("Introduction"));
+        assert!(is_usable_outline_title("1 Introduction"));
+        assert!(is_usable_outline_title("【技術分野】"));
+        assert!(is_usable_outline_title("Table of Contents"));
     }
 
     #[test]
