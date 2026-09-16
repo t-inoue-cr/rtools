@@ -67,9 +67,14 @@ pub enum PageBlock {
 }
 
 const HEADING_SIZE_RATIO: f32 = 1.25;
-const CONTINUE_BASELINE_RATIO: f32 = 1.6;
 const OVERLAP_DROP: f32 = 0.4;
 const INDENT_BREAK_EM: f32 = 2.0;
+/// Docling `add_orphan_regions`: 同一行とみなす上端差（行高の比）。
+const SAME_LINE_TOP_RATIO: f32 = 0.9;
+/// Docling `recover_text_panels`: 段落区切りは median leading のこの倍数。
+const LEADING_BREAK_RATIO: f32 = 1.8;
+/// 行送りが極端に小さいときの下限（median 行高の比）。
+const MIN_BREAK_HEIGHT_RATIO: f32 = 0.75;
 
 /// 行と表から段落・見出し・表ブロックを組み立てる。
 pub fn reconstruct_page(
@@ -88,10 +93,12 @@ pub fn reconstruct_page(
         return Vec::new();
     }
 
+    let lines = merge_same_lines(lines);
     let median_size = median_f32(lines.iter().map(|line| line.height.max(line.font_size)));
     let gutter = detect_gutter(&lines);
     let items = ordered_items(lines, tables, gutter);
-    merge_items(items, median_size)
+    let leading = median_line_gap(&items);
+    merge_items(items, median_size, leading)
 }
 
 pub fn blocks_to_markdown(blocks: &[PageBlock]) -> String {
@@ -271,7 +278,80 @@ fn sort_items(items: &mut [Item]) {
     });
 }
 
-fn merge_items(items: Vec<Item>, median_size: f32) -> Vec<PageBlock> {
+fn merge_same_lines(mut lines: Vec<LayoutLine>) -> Vec<LayoutLine> {
+    if lines.len() < 2 {
+        return lines;
+    }
+    lines.sort_by(|a, b| {
+        b.visual_top()
+            .total_cmp(&a.visual_top())
+            .then_with(|| a.x.total_cmp(&b.x))
+    });
+    let mut rows: Vec<Vec<LayoutLine>> = Vec::new();
+    for line in lines {
+        if let Some(row) = rows.last_mut()
+            && let Some(last) = row.last()
+        {
+            let h = last.height.max(line.height).max(1.0);
+            if (last.visual_top() - line.visual_top()).abs() < h * SAME_LINE_TOP_RATIO {
+                row.push(line);
+                continue;
+            }
+        }
+        rows.push(vec![line]);
+    }
+
+    let mut merged = Vec::new();
+    for mut row in rows {
+        row.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let mut row_merged: Vec<LayoutLine> = Vec::with_capacity(row.len());
+        for line in row {
+            if row_merged.last().is_some_and(|last| {
+                let h = last.height.max(line.height).max(1.0);
+                line.x <= last.right() + h
+            }) {
+                let prev = row_merged.pop().expect("last fragment");
+                row_merged.push(join_lines(prev, &line));
+            } else {
+                row_merged.push(line);
+            }
+        }
+        merged.extend(row_merged);
+    }
+    merged
+}
+
+fn is_same_line(prev: &LayoutLine, next: &LayoutLine) -> bool {
+    let h = prev.height.max(next.height).max(1.0);
+    let same_line = (prev.visual_top() - next.visual_top()).abs() < h * SAME_LINE_TOP_RATIO;
+    let touching = next.x <= prev.right() + h && next.x >= prev.x - h;
+    same_line && touching
+}
+
+fn median_line_gap(items: &[Item]) -> f32 {
+    let mut gaps = Vec::new();
+    let mut prev_line: Option<&LayoutLine> = None;
+    for item in items {
+        match item {
+            Item::Table(_) => prev_line = None,
+            Item::Line(line) => {
+                if let Some(prev) = prev_line {
+                    let gap = (prev.y - line.visual_top()).max(0.0);
+                    gaps.push(gap);
+                }
+                prev_line = Some(line);
+            }
+        }
+    }
+    median_f32(gaps.into_iter())
+}
+
+fn paragraph_break_threshold(leading: f32, median_size: f32) -> f32 {
+    let height = median_size.max(1.0);
+    (LEADING_BREAK_RATIO * leading.max(0.0)).max(MIN_BREAK_HEIGHT_RATIO * height)
+}
+
+fn merge_items(items: Vec<Item>, median_size: f32, leading: f32) -> Vec<PageBlock> {
     let mut blocks = Vec::new();
     let mut paragraph: Option<LayoutLine> = None;
 
@@ -294,7 +374,7 @@ fn merge_items(items: Vec<Item>, median_size: f32) -> Vec<PageBlock> {
                     continue;
                 }
                 match paragraph.take() {
-                    Some(prev) if should_continue(&prev, &line, median_size) => {
+                    Some(prev) if should_continue(&prev, &line, median_size, leading) => {
                         paragraph = Some(join_lines(prev, &line));
                     }
                     Some(prev) => {
@@ -335,22 +415,25 @@ fn join_lines(mut prev: LayoutLine, next: &LayoutLine) -> LayoutLine {
     prev
 }
 
-fn should_continue(prev: &LayoutLine, next: &LayoutLine, median_size: f32) -> bool {
+fn should_continue(prev: &LayoutLine, next: &LayoutLine, median_size: f32, leading: f32) -> bool {
     if is_heading(next, median_size) {
         return false;
     }
-    let baseline = median_size.max(1.0);
+    if is_same_line(prev, next) {
+        return true;
+    }
     let dy = prev.visual_top() - next.visual_top();
-    if dy <= 0.0 || dy > CONTINUE_BASELINE_RATIO * baseline {
+    if dy <= 0.0 {
         return false;
     }
-    if ends_sentence(&prev.text) {
+    if next.right() < prev.x {
         return false;
     }
     if next.x - prev.x > INDENT_BREAK_EM * median_size.max(1.0) {
         return false;
     }
-    true
+    let gap = (prev.y - next.visual_top()).max(0.0);
+    gap <= paragraph_break_threshold(leading, median_size)
 }
 
 fn is_heading(line: &LayoutLine, median_size: f32) -> bool {
@@ -492,13 +575,6 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
-fn ends_sentence(text: &str) -> bool {
-    matches!(
-        text.trim_end().chars().last(),
-        Some('。' | '．' | '！' | '？' | '.' | '!' | '?' | '…')
-    )
-}
-
 fn collapse_inline_ws(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = true;
@@ -612,18 +688,67 @@ mod tests {
     }
 
     #[test]
-    fn splits_after_japanese_period() {
+    fn joins_wrapped_lines_with_wide_leading() {
         let lines = [
-            line("これは一文です。", 50.0, 700.0, 160.0, 14.0, 12.0),
-            line("次の段落です。", 50.0, 684.0, 140.0, 14.0, 12.0),
+            line("特性排気速度効率を向", 50.0, 700.0, 200.0, 14.0, 12.0),
+            line("上できるインジェクタ。", 50.0, 672.0, 180.0, 14.0, 12.0),
         ];
         let blocks = reconstruct_page(lines.into(), Vec::new());
         assert_eq!(
             blocks,
+            vec![PageBlock::Paragraph(
+                "特性排気速度効率を向上できるインジェクタ。".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn joins_after_japanese_period_when_leading_matches() {
+        let lines = [
+            line("これは一文です。", 50.0, 700.0, 160.0, 14.0, 12.0),
+            line("次の文です。", 50.0, 684.0, 140.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![PageBlock::Paragraph("これは一文です。次の文です。".into())]
+        );
+    }
+
+    #[test]
+    fn splits_when_vertical_gap_exceeds_leading() {
+        let mut lines = Vec::new();
+        for i in 0..3 {
+            let y = 700.0 - i as f32 * 16.0;
+            lines.push(line(&format!("上{i}。"), 50.0, y, 140.0, 14.0, 12.0));
+        }
+        for i in 0..3 {
+            let y = 520.0 - i as f32 * 16.0;
+            lines.push(line(&format!("下{i}。"), 50.0, y, 140.0, 14.0, 12.0));
+        }
+        let blocks = reconstruct_page(lines, Vec::new());
+        assert_eq!(
+            blocks,
             vec![
-                PageBlock::Paragraph("これは一文です。".into()),
-                PageBlock::Paragraph("次の段落です。".into()),
+                PageBlock::Paragraph("上0。上1。上2。".into()),
+                PageBlock::Paragraph("下0。下1。下2。".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn joins_same_visual_line_fragments() {
+        let lines = [
+            line("第１の端部、", 50.0, 700.0, 90.0, 14.0, 12.0),
+            line("第２の端部、", 145.0, 701.0, 90.0, 14.0, 12.0),
+            line("チャンバを囲む", 240.0, 699.5, 100.0, 14.0, 12.0),
+        ];
+        let blocks = reconstruct_page(lines.into(), Vec::new());
+        assert_eq!(
+            blocks,
+            vec![PageBlock::Paragraph(
+                "第１の端部、第２の端部、チャンバを囲む".into()
+            )]
         );
     }
 
