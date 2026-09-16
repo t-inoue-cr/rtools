@@ -38,10 +38,17 @@ enum ConvertKind {
 }
 
 impl ConvertKind {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::PdfOxide => "PDF",
+            Self::Docling => "文書",
+        }
+    }
+
     fn busy_hint(self) -> &'static str {
         match self {
             Self::PdfOxide => "PDFを変換中…",
-            Self::Docling => "文書を変換中…",
+            Self::Docling => "Doclingで変換中…",
         }
     }
 
@@ -49,6 +56,44 @@ impl ConvertKind {
         match self {
             Self::PdfOxide => "PDF の変換に失敗しました",
             Self::Docling => "文書の変換に失敗しました",
+        }
+    }
+
+    fn pick_title(self) -> &'static str {
+        match self {
+            Self::PdfOxide => "PDFを選択",
+            Self::Docling => "文書を選択",
+        }
+    }
+
+    fn thread_name(self) -> &'static str {
+        match self {
+            Self::PdfOxide => "pdf-to-markdown",
+            Self::Docling => "docling-to-markdown",
+        }
+    }
+
+    fn convert(self, path: &Path) -> Result<String, String> {
+        match self {
+            Self::PdfOxide => pdf_to_markdown(path),
+            Self::Docling => document_to_markdown(path),
+        }
+    }
+
+    fn pick_file(self) -> Option<PathBuf> {
+        let dialog = rfd::FileDialog::new().set_title(self.pick_title());
+        match self {
+            Self::PdfOxide => dialog.add_filter("PDF", &["pdf"]).pick_file(),
+            Self::Docling => dialog
+                .add_filter("文書", DOCLING_FILE_EXTENSIONS)
+                .add_filter("PDF", &["pdf"])
+                .add_filter("Word", &["docx", "doc", "odt", "rtf"])
+                .add_filter("Excel", &["xlsx", "xls", "ods", "csv"])
+                .add_filter("PowerPoint", &["pptx", "ppt", "odp"])
+                .add_filter("HTML", &["html", "htm", "xhtml", "mhtml", "mht"])
+                .add_filter("Markdown", &["md"])
+                .add_filter("EPUB", &["epub"])
+                .pick_file(),
         }
     }
 }
@@ -64,24 +109,18 @@ enum ConvertState {
         rx: Receiver<Result<String, String>>,
     },
     PickSave {
-        kind: ConvertKind,
         markdown: String,
         file_name: String,
     },
-    Writing {
-        kind: ConvertKind,
-        rx: Receiver<Result<PathBuf, String>>,
-    },
+    Writing(Receiver<Result<PathBuf, String>>),
 }
 
 impl ConvertState {
-    fn kind(&self) -> Option<ConvertKind> {
+    fn busy_hint(&self) -> Option<&'static str> {
         match self {
             Self::Idle => None,
-            Self::PickFile { kind }
-            | Self::Converting { kind, .. }
-            | Self::PickSave { kind, .. }
-            | Self::Writing { kind, .. } => Some(*kind),
+            Self::PickFile { kind } | Self::Converting { kind, .. } => Some(kind.busy_hint()),
+            Self::PickSave { .. } | Self::Writing(_) => Some("保存中…"),
         }
     }
 }
@@ -151,6 +190,13 @@ fn load_japanese_font() -> Option<egui::FontData> {
         }
     }
     None
+}
+
+fn toolbar_button(label: &'static str) -> egui::Button<'static> {
+    egui::Button::new(label)
+        .min_size(egui::vec2(0.0, 40.0))
+        .corner_radius(6.0)
+        .fill(egui::Color32::from_rgb(232, 240, 254))
 }
 
 fn apply_ui_style(ctx: &egui::Context) {
@@ -333,8 +379,8 @@ impl RToolsApp {
             Some("ファイル一覧を処理中…")
         } else if !matches!(self.ingest, IngestState::Idle) {
             Some("PDFを登録中…")
-        } else if let Some(kind) = self.convert.kind() {
-            Some(kind.busy_hint())
+        } else if let Some(hint) = self.convert.busy_hint() {
+            Some(hint)
         } else if self.search_rx.is_some() {
             Some("検索中…")
         } else {
@@ -355,10 +401,7 @@ impl RToolsApp {
     }
 
     fn start_convert(&mut self, kind: ConvertKind) {
-        match kind {
-            ConvertKind::PdfOxide => self.log_line("PDF の選択ダイアログを開きます。"),
-            ConvertKind::Docling => self.log_line("文書の選択ダイアログを開きます。"),
-        }
+        self.log_line(format!("{} の選択ダイアログを開きます。", kind.noun()));
         self.convert = ConvertState::PickFile { kind };
         self.yield_before_action = true;
     }
@@ -464,7 +507,7 @@ impl RToolsApp {
                     self.pick_convert_save();
                 }
             }
-            ConvertState::Writing { .. } => self.poll_convert_writing(ctx),
+            ConvertState::Writing(_) => self.poll_convert_writing(ctx),
         }
     }
 
@@ -738,36 +781,12 @@ impl RToolsApp {
             return;
         };
 
-        let picked = match kind {
-            ConvertKind::PdfOxide => rfd::FileDialog::new()
-                .set_title("PDFを選択")
-                .add_filter("PDF", &["pdf"])
-                .pick_file(),
-            ConvertKind::Docling => rfd::FileDialog::new()
-                .set_title("文書を選択")
-                .add_filter("文書", DOCLING_FILE_EXTENSIONS)
-                .add_filter("PDF", &["pdf"])
-                .add_filter("Word", &["docx", "doc", "odt", "rtf"])
-                .add_filter("Excel", &["xlsx", "xls", "ods", "csv"])
-                .add_filter("PowerPoint", &["pptx", "ppt", "odp"])
-                .add_filter("HTML", &["html", "htm", "xhtml", "mhtml", "mht"])
-                .add_filter("Markdown", &["md"])
-                .add_filter("EPUB", &["epub"])
-                .pick_file(),
-        };
-
-        let Some(path) = picked else {
-            match kind {
-                ConvertKind::PdfOxide => self.log_line("PDF の選択をキャンセルしました。"),
-                ConvertKind::Docling => self.log_line("文書の選択をキャンセルしました。"),
-            }
+        let Some(path) = kind.pick_file() else {
+            self.log_line(format!("{} の選択をキャンセルしました。", kind.noun()));
             return;
         };
 
-        match kind {
-            ConvertKind::PdfOxide => self.log_line(format!("PDF: {}", path.display())),
-            ConvertKind::Docling => self.log_line(format!("文書: {}", path.display())),
-        }
+        self.log_line(format!("{}: {}", kind.noun(), path.display()));
         self.log_line("Markdown に変換しています。");
         self.start_converting(kind, path);
     }
@@ -781,18 +800,10 @@ impl RToolsApp {
             rx,
         };
 
-        let thread_name = match kind {
-            ConvertKind::PdfOxide => "pdf-to-markdown",
-            ConvertKind::Docling => "docling-to-markdown",
-        };
         std::thread::Builder::new()
-            .name(thread_name.into())
+            .name(kind.thread_name().into())
             .spawn(move || {
-                let result = match kind {
-                    ConvertKind::PdfOxide => pdf_to_markdown(&path),
-                    ConvertKind::Docling => document_to_markdown(&path),
-                };
-                let _ = tx.send(result);
+                let _ = tx.send(kind.convert(&path));
             })
             .expect("failed to spawn convert thread");
     }
@@ -805,9 +816,8 @@ impl RToolsApp {
 
         match recv {
             Ok(result) => {
-                let ConvertState::Converting {
-                    kind, file_name, ..
-                } = std::mem::replace(&mut self.convert, ConvertState::Idle)
+                let ConvertState::Converting { file_name, .. } =
+                    std::mem::replace(&mut self.convert, ConvertState::Idle)
                 else {
                     return;
                 };
@@ -815,14 +825,13 @@ impl RToolsApp {
                     Ok(markdown) => {
                         self.log_line("保存先の選択ダイアログを開きます。");
                         self.convert = ConvertState::PickSave {
-                            kind,
                             markdown,
                             file_name,
                         };
                         self.yield_before_action = true;
                     }
                     Err(err) => {
-                        self.log_line(format!("{}: {err}", kind.fail_label()));
+                        self.log_line(err);
                     }
                 }
             }
@@ -830,7 +839,10 @@ impl RToolsApp {
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                let kind = self.convert.kind().unwrap_or(ConvertKind::PdfOxide);
+                let kind = match &self.convert {
+                    ConvertState::Converting { kind, .. } => *kind,
+                    _ => ConvertKind::PdfOxide,
+                };
                 self.convert = ConvertState::Idle;
                 self.log_line(format!("{}: ワーカーが終了しました。", kind.fail_label()));
             }
@@ -839,7 +851,6 @@ impl RToolsApp {
 
     fn pick_convert_save(&mut self) {
         let ConvertState::PickSave {
-            kind,
             markdown,
             file_name,
         } = std::mem::replace(&mut self.convert, ConvertState::Idle)
@@ -858,12 +869,12 @@ impl RToolsApp {
         };
 
         self.log_line(format!("保存しています: {}", save_path.display()));
-        self.start_convert_write(kind, markdown, save_path);
+        self.start_convert_write(markdown, save_path);
     }
 
-    fn start_convert_write(&mut self, kind: ConvertKind, markdown: String, save_path: PathBuf) {
+    fn start_convert_write(&mut self, markdown: String, save_path: PathBuf) {
         let (tx, rx) = mpsc::channel();
-        self.convert = ConvertState::Writing { kind, rx };
+        self.convert = ConvertState::Writing(rx);
 
         std::thread::Builder::new()
             .name("write-markdown".into())
@@ -878,7 +889,7 @@ impl RToolsApp {
 
     fn poll_convert_writing(&mut self, ctx: &egui::Context) {
         let recv = match &self.convert {
-            ConvertState::Writing { rx, .. } => rx.try_recv(),
+            ConvertState::Writing(rx) => rx.try_recv(),
             _ => return,
         };
 
@@ -959,35 +970,28 @@ impl eframe::App for RToolsApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let export_button = egui::Button::new("フォルダ内のファイル一覧を保存")
-                        .min_size(egui::vec2(0.0, 40.0))
-                        .corner_radius(6.0)
-                        .fill(egui::Color32::from_rgb(232, 240, 254));
-                    if ui.add_enabled(idle, export_button).clicked() {
+                    if ui
+                        .add_enabled(idle, toolbar_button("フォルダ内のファイル一覧を保存"))
+                        .clicked()
+                    {
                         self.start_export();
                     }
-
-                    let ingest_button = egui::Button::new("PDFをOpenSearchに登録")
-                        .min_size(egui::vec2(0.0, 40.0))
-                        .corner_radius(6.0)
-                        .fill(egui::Color32::from_rgb(232, 240, 254));
-                    if ui.add_enabled(idle, ingest_button).clicked() {
+                    if ui
+                        .add_enabled(idle, toolbar_button("PDFをOpenSearchに登録"))
+                        .clicked()
+                    {
                         self.start_ingest();
                     }
-
-                    let convert_button = egui::Button::new("PDFをMarkdownに変換")
-                        .min_size(egui::vec2(0.0, 40.0))
-                        .corner_radius(6.0)
-                        .fill(egui::Color32::from_rgb(232, 240, 254));
-                    if ui.add_enabled(idle, convert_button).clicked() {
+                    if ui
+                        .add_enabled(idle, toolbar_button("PDFをMarkdownに変換"))
+                        .clicked()
+                    {
                         self.start_convert(ConvertKind::PdfOxide);
                     }
-
-                    let docling_button = egui::Button::new("文章変換")
-                        .min_size(egui::vec2(0.0, 40.0))
-                        .corner_radius(6.0)
-                        .fill(egui::Color32::from_rgb(232, 240, 254));
-                    if ui.add_enabled(idle, docling_button).clicked() {
+                    if ui
+                        .add_enabled(idle, toolbar_button("Docling文章変換"))
+                        .clicked()
+                    {
                         self.start_convert(ConvertKind::Docling);
                     }
 
