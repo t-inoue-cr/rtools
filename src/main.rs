@@ -201,6 +201,7 @@ struct RToolsApp {
     search_hits: Vec<SearchHit>,
     search_max_score: f64,
     search_status: String,
+    search_scroll_to_top: bool,
 }
 
 impl RToolsApp {
@@ -243,6 +244,7 @@ impl RToolsApp {
             search_hits: Vec::new(),
             search_max_score: 0.0,
             search_status: "検索結果はここに表示されます。".into(),
+            search_scroll_to_top: false,
         };
         app.log_line("rtools を起動しました。");
         match settings::load_settings() {
@@ -439,6 +441,7 @@ impl RToolsApp {
                     outcome.total,
                     self.search_hits.len()
                 );
+                self.search_scroll_to_top = true;
                 self.log_line(self.search_status.clone());
             }
             Ok(Err(err)) => {
@@ -446,6 +449,7 @@ impl RToolsApp {
                 self.search_hits.clear();
                 self.search_max_score = 0.0;
                 self.search_status = format!("検索に失敗しました: {err}");
+                self.search_scroll_to_top = true;
                 self.log_line(self.search_status.clone());
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -456,6 +460,7 @@ impl RToolsApp {
                 self.search_hits.clear();
                 self.search_max_score = 0.0;
                 self.search_status = "検索に失敗しました: ワーカーが終了しました。".into();
+                self.search_scroll_to_top = true;
                 self.log_line(self.search_status.clone());
             }
         }
@@ -995,10 +1000,14 @@ impl eframe::App for RToolsApp {
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(8, 8))
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
+                    let mut scroll = egui::ScrollArea::vertical()
                         .id_salt("search-hits")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                        .auto_shrink([false, false]);
+                    if self.search_scroll_to_top {
+                        scroll = scroll.vertical_scroll_offset(0.0);
+                        self.search_scroll_to_top = false;
+                    }
+                    scroll.show(ui, |ui| {
                             if self.search_hits.is_empty() {
                                 ui.label("ヒットはありません。");
                                 return;
