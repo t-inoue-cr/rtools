@@ -1,9 +1,3 @@
-mod embedding;
-mod opensearch;
-mod pdf;
-mod pdf_layout;
-mod settings;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,9 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use opensearch::{IngestReport, SearchHit, SearchOutcome, snippet_segments};
-use pdf::{collect_pdfs, markdown_file_name, pdf_to_markdown};
-use settings::OpenSearchSettings;
+use rtools::opensearch::{
+    IngestReport, SearchHit, SearchOutcome, ingest_files, knn_search, search, snippet_segments,
+};
+use rtools::pdf::{collect_pdfs, markdown_file_name, pdf_to_markdown};
+use rtools::settings::{self, OpenSearchSettings};
 
 enum ExportState {
     Idle,
@@ -350,8 +346,8 @@ impl RToolsApp {
             .name("opensearch-search".into())
             .spawn(move || {
                 let result = match kind {
-                    SearchKind::Keyword => opensearch::search(&settings, &query),
-                    SearchKind::Sentence => opensearch::knn_search(&settings, &query),
+                    SearchKind::Keyword => search(&settings, &query),
+                    SearchKind::Sentence => knn_search(&settings, &query),
                 };
                 if let Err(err) = &result {
                     let _ = log_tx.send(format!("検索に失敗しました: {err}"));
@@ -522,7 +518,7 @@ impl RToolsApp {
                     if pdfs.len() > 20 {
                         let _ = log_tx.send(format!("  …ほか {} 件", pdfs.len() - 20));
                     }
-                    opensearch::ingest_files(&settings, &pdfs, &log_tx)
+                    ingest_files(&settings, &pdfs, &log_tx)
                 })();
                 let _ = tx.send(result);
             })
@@ -1008,25 +1004,25 @@ impl eframe::App for RToolsApp {
                         self.search_scroll_to_top = false;
                     }
                     scroll.show(ui, |ui| {
-                            if self.search_hits.is_empty() {
-                                ui.label("ヒットはありません。");
-                                return;
+                        if self.search_hits.is_empty() {
+                            ui.label("ヒットはありません。");
+                            return;
+                        }
+                        for hit in &self.search_hits {
+                            ui.horizontal(|ui| {
+                                ui.label(similarity_label(hit.score, self.search_max_score));
+                                ui.strong(&hit.title);
+                                ui.label(format!("p.{}", hit.page));
+                            });
+                            if !hit.path.is_empty() {
+                                ui.weak(&hit.path);
                             }
-                            for hit in &self.search_hits {
-                                ui.horizontal(|ui| {
-                                    ui.label(similarity_label(hit.score, self.search_max_score));
-                                    ui.strong(&hit.title);
-                                    ui.label(format!("p.{}", hit.page));
-                                });
-                                if !hit.path.is_empty() {
-                                    ui.weak(&hit.path);
-                                }
-                                if !hit.snippet.is_empty() {
-                                    show_highlighted_snippet(ui, &hit.snippet);
-                                }
-                                ui.separator();
+                            if !hit.snippet.is_empty() {
+                                show_highlighted_snippet(ui, &hit.snippet);
                             }
-                        });
+                            ui.separator();
+                        }
+                    });
                 });
         });
 
